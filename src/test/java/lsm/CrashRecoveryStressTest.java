@@ -9,6 +9,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 
+
+
 import static org.junit.jupiter.api.Assertions.*;
 
 class CrashRecoveryStressTest {
@@ -170,5 +172,96 @@ class CrashRecoveryStressTest {
         assertEquals(Optional.of("coffee"), engine2.get("café"));
         assertEquals(Optional.of("rocket"), engine2.get("🚀"));
         engine2.close();
+    }
+
+    @Test
+    void fiveCrashRecoverCyclesWithInterleavedWrites() {
+        Map<String, String> reference = new HashMap<>();
+
+        for (int cycle = 0; cycle < 5; cycle++) {
+            LSMStoreEngine engine = new LSMStoreEngine(tempDir);
+
+            // Verify everything from previous cycles
+            for (Map.Entry<String, String> e : reference.entrySet()) {
+                assertEquals(Optional.of(e.getValue()), engine.get(e.getKey()),
+                        "Cycle " + cycle + " lost key: " + e.getKey());
+            }
+
+            // Write new data this cycle
+            for (int i = 0; i < 50; i++) {
+                String key = "cycle" + cycle + "-key" + i;
+                String val = "cycle" + cycle + "-val" + i;
+                engine.put(key, val);
+                reference.put(key, val);
+            }
+            // crash — no close()
+        }
+
+        // Final verification
+        LSMStoreEngine finalEngine = new LSMStoreEngine(tempDir);
+        for (Map.Entry<String, String> e : reference.entrySet()) {
+            assertEquals(Optional.of(e.getValue()), finalEngine.get(e.getKey()),
+                    "Final check lost key: " + e.getKey());
+        }
+        assertEquals(250, reference.size());
+        finalEngine.close();
+    }
+
+    @Test
+    void walWriteOnDiskBeforeGetSees() {
+        LSMStoreEngine engine = new LSMStoreEngine(tempDir);
+        java.io.File walFile = tempDir.resolve("wal.log").toFile();
+
+        long sizeBefore = walFile.length();
+        engine.put("k1", "v1");
+        long sizeAfterPut = walFile.length();
+        assertTrue(sizeAfterPut > sizeBefore,
+                "WAL must grow on disk after put, before get can return the value");
+
+        assertEquals(Optional.of("v1"), engine.get("k1"));
+        engine.close();
+    }
+
+    @Test
+    void overwriteAcrossMultipleCrashCycles() {
+        LSMStoreEngine engine1 = new LSMStoreEngine(tempDir);
+        engine1.put("shared", "v1");
+        // crash
+
+        LSMStoreEngine engine2 = new LSMStoreEngine(tempDir);
+        assertEquals(Optional.of("v1"), engine2.get("shared"));
+        engine2.put("shared", "v2");
+        // crash
+
+        LSMStoreEngine engine3 = new LSMStoreEngine(tempDir);
+        assertEquals(Optional.of("v2"), engine3.get("shared"));
+        engine3.put("shared", "v3");
+        engine3.close();
+
+        LSMStoreEngine engine4 = new LSMStoreEngine(tempDir);
+        assertEquals(Optional.of("v3"), engine4.get("shared"));
+        engine4.close();
+    }
+
+    @Test
+    void deleteAcrossMultipleCrashCycles() {
+        LSMStoreEngine engine1 = new LSMStoreEngine(tempDir);
+        engine1.put("victim", "alive");
+        // crash
+
+        LSMStoreEngine engine2 = new LSMStoreEngine(tempDir);
+        assertEquals(Optional.of("alive"), engine2.get("victim"));
+        engine2.delete("victim");
+        // crash
+
+        LSMStoreEngine engine3 = new LSMStoreEngine(tempDir);
+        assertEquals(Optional.empty(), engine3.get("victim"));
+
+        engine3.put("victim", "resurrected");
+        // crash
+
+        LSMStoreEngine engine4 = new LSMStoreEngine(tempDir);
+        assertEquals(Optional.of("resurrected"), engine4.get("victim"));
+        engine4.close();
     }
 }
