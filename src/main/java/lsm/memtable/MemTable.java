@@ -1,7 +1,8 @@
 package lsm.memtable;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.Map;
-import java.util.Optional;
 import java.util.TreeMap;
 
 public class MemTable {
@@ -17,32 +18,23 @@ public class MemTable {
     public void put(String key, String value) {
         Entry old = data.get(key);
         if (old != null) {
-            sizeBytes -= key.getBytes().length + old.sizeBytes();
+            sizeBytes -= keySize(key) + old.sizeBytes();
         }
         Entry entry = Entry.put(value);
         data.put(key, entry);
-        sizeBytes += key.getBytes().length + entry.sizeBytes();
+        sizeBytes += keySize(key) + entry.sizeBytes();
     }
 
     public void delete(String key) {
         Entry old = data.get(key);
         if (old != null) {
-            sizeBytes -= key.getBytes().length + old.sizeBytes();
+            sizeBytes -= keySize(key) + old.sizeBytes();
         }
         Entry tombstone = Entry.tombstone();
         data.put(key, tombstone);
-        sizeBytes += key.getBytes().length;
+        sizeBytes += keySize(key);
     }
 
-    /**
-     * Returns:
-     *   - Optional containing the value if the key exists with a PUT
-     *   - Optional containing empty-Entry (tombstone) if the key was deleted
-     *   - null if the key is not in this MemTable at all
-     *
-     * The caller needs to distinguish "not here" (check older sources) from
-     * "deleted" (stop looking, key is gone).
-     */
     public Entry get(String key) {
         return data.get(key);
     }
@@ -64,11 +56,15 @@ public class MemTable {
     }
 
     public Map<String, Entry> entries() {
-        return data;
+        return Collections.unmodifiableMap(data);
     }
 
     public void clear() {
         data.clear();
         sizeBytes = 0;
+    }
+
+    private static int keySize(String key) {
+        return key.getBytes(StandardCharsets.UTF_8).length;
     }
 }

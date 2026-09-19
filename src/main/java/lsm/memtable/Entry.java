@@ -1,12 +1,8 @@
 package lsm.memtable;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Optional;
 
-/**
- * Wraps a value in the MemTable. A present value means a PUT; an empty value means a DELETE
- * (tombstone). We use this instead of null so we can distinguish "key was deleted" from
- * "key was never written" — both would be null in a plain TreeMap.
- */
 public record Entry(Optional<String> value) {
 
     public static Entry put(String value) {
@@ -22,6 +18,6 @@ public record Entry(Optional<String> value) {
     }
 
     public int sizeBytes() {
-        return value.map(v -> v.getBytes().length).orElse(0);
+        return value.map(v -> v.getBytes(StandardCharsets.UTF_8).length).orElse(0);
     }
 }

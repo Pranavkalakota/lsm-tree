@@ -17,6 +17,7 @@ public class LSMStoreEngine implements StorageEngine {
     private final MemTable memTable;
     private final WriteAheadLog wal;
     private final Path dataDir;
+    private volatile boolean closed = false;
 
     public LSMStoreEngine(Path dataDir) {
         this(dataDir, DEFAULT_MEMTABLE_SIZE);
@@ -30,7 +31,6 @@ public class LSMStoreEngine implements StorageEngine {
             this.memTable = new MemTable(memTableMaxSize);
             Path walPath = dataDir.resolve("wal.log");
 
-            // Replay any existing WAL before accepting new writes (crash recovery)
             WriteAheadLog.replay(walPath, memTable);
 
             this.wal = new WriteAheadLog(walPath);
@@ -41,6 +41,7 @@ public class LSMStoreEngine implements StorageEngine {
 
     @Override
     public void put(String key, String value) {
+        checkNotClosed();
         if (key == null) throw new IllegalArgumentException("key must not be null");
         if (value == null) throw new IllegalArgumentException("value must not be null");
         try {
@@ -53,6 +54,7 @@ public class LSMStoreEngine implements StorageEngine {
 
     @Override
     public Optional<String> get(String key) {
+        checkNotClosed();
         if (key == null) throw new IllegalArgumentException("key must not be null");
 
         Entry entry = memTable.get(key);
@@ -68,6 +70,7 @@ public class LSMStoreEngine implements StorageEngine {
 
     @Override
     public void delete(String key) {
+        checkNotClosed();
         if (key == null) throw new IllegalArgumentException("key must not be null");
         try {
             wal.appendDelete(key);
@@ -79,10 +82,18 @@ public class LSMStoreEngine implements StorageEngine {
 
     @Override
     public void close() {
+        if (closed) return;
+        closed = true;
         try {
             wal.close();
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to close WAL", e);
+        }
+    }
+
+    private void checkNotClosed() {
+        if (closed) {
+            throw new IllegalStateException("Storage engine is closed");
         }
     }
 }
