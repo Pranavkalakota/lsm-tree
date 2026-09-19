@@ -2,7 +2,12 @@ package lsm;
 
 import lsm.memtable.Entry;
 import lsm.memtable.MemTable;
+import lsm.wal.WriteAheadLog;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Optional;
 
 public class LSMStoreEngine implements StorageEngine {
@@ -10,19 +15,39 @@ public class LSMStoreEngine implements StorageEngine {
     private static final long DEFAULT_MEMTABLE_SIZE = 4 * 1024 * 1024; // 4 MB
 
     private final MemTable memTable;
+    private final WriteAheadLog wal;
+    private final Path dataDir;
 
-    public LSMStoreEngine() {
-        this(DEFAULT_MEMTABLE_SIZE);
+    public LSMStoreEngine(Path dataDir) {
+        this(dataDir, DEFAULT_MEMTABLE_SIZE);
     }
 
-    public LSMStoreEngine(long memTableMaxSize) {
-        this.memTable = new MemTable(memTableMaxSize);
+    public LSMStoreEngine(Path dataDir, long memTableMaxSize) {
+        try {
+            this.dataDir = dataDir;
+            Files.createDirectories(dataDir);
+
+            this.memTable = new MemTable(memTableMaxSize);
+            Path walPath = dataDir.resolve("wal.log");
+
+            // Replay any existing WAL before accepting new writes (crash recovery)
+            WriteAheadLog.replay(walPath, memTable);
+
+            this.wal = new WriteAheadLog(walPath);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to initialize storage engine", e);
+        }
     }
 
     @Override
     public void put(String key, String value) {
         if (key == null) throw new IllegalArgumentException("key must not be null");
         if (value == null) throw new IllegalArgumentException("value must not be null");
+        try {
+            wal.appendPut(key, value);
+        } catch (IOException e) {
+            throw new UncheckedIOException("WAL write failed", e);
+        }
         memTable.put(key, value);
     }
 
@@ -44,11 +69,20 @@ public class LSMStoreEngine implements StorageEngine {
     @Override
     public void delete(String key) {
         if (key == null) throw new IllegalArgumentException("key must not be null");
+        try {
+            wal.appendDelete(key);
+        } catch (IOException e) {
+            throw new UncheckedIOException("WAL write failed", e);
+        }
         memTable.delete(key);
     }
 
     @Override
     public void close() {
-        // Phase 1: nothing to flush yet — no persistence layer
+        try {
+            wal.close();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to close WAL", e);
+        }
     }
 }

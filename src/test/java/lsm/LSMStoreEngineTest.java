@@ -2,18 +2,23 @@ package lsm;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Path;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class LSMStoreEngineTest {
 
+    @TempDir
+    Path tempDir;
+
     private StorageEngine engine;
 
     @BeforeEach
     void setUp() {
-        engine = new LSMStoreEngine();
+        engine = new LSMStoreEngine(tempDir);
     }
 
     @Test
