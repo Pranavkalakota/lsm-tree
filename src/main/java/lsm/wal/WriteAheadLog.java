@@ -3,6 +3,7 @@ package lsm.wal;
 import lsm.memtable.MemTable;
 
 import java.io.*;
+import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -13,17 +14,17 @@ public class WriteAheadLog implements Closeable {
 
     private static final byte OP_PUT = 1;
     private static final byte OP_DELETE = 2;
-    private static final int MAX_KEY_SIZE = 10 * 1024 * 1024;   // 10 MB
-    private static final int MAX_VALUE_SIZE = 100 * 1024 * 1024; // 100 MB
+    private static final int MAX_KEY_SIZE = 10 * 1024 * 1024;
+    private static final int MAX_VALUE_SIZE = 100 * 1024 * 1024;
 
     private final Path path;
-    private DataOutputStream out;
     private FileChannel channel;
     private boolean closed = false;
 
     public WriteAheadLog(Path path) throws IOException {
         this.path = path;
-        openStream();
+        this.channel = FileChannel.open(path,
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
     }
 
     public void appendPut(String key, String value) throws IOException {
@@ -31,12 +32,19 @@ public class WriteAheadLog implements Closeable {
         byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
         byte[] valBytes = value.getBytes(StandardCharsets.UTF_8);
 
-        out.writeByte(OP_PUT);
-        out.writeInt(keyBytes.length);
-        out.write(keyBytes);
-        out.writeInt(valBytes.length);
-        out.write(valBytes);
-        out.flush();
+        // Pack the entire record into one buffer so it's written atomically
+        // to the channel: [op:1][keyLen:4][key:N][valLen:4][val:M]
+        ByteBuffer buf = ByteBuffer.allocate(1 + 4 + keyBytes.length + 4 + valBytes.length);
+        buf.put(OP_PUT);
+        buf.putInt(keyBytes.length);
+        buf.put(keyBytes);
+        buf.putInt(valBytes.length);
+        buf.put(valBytes);
+        buf.flip();
+
+        while (buf.hasRemaining()) {
+            channel.write(buf);
+        }
         channel.force(false);
     }
 
@@ -44,10 +52,15 @@ public class WriteAheadLog implements Closeable {
         checkNotClosed();
         byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
 
-        out.writeByte(OP_DELETE);
-        out.writeInt(keyBytes.length);
-        out.write(keyBytes);
-        out.flush();
+        ByteBuffer buf = ByteBuffer.allocate(1 + 4 + keyBytes.length);
+        buf.put(OP_DELETE);
+        buf.putInt(keyBytes.length);
+        buf.put(keyBytes);
+        buf.flip();
+
+        while (buf.hasRemaining()) {
+            channel.write(buf);
+        }
         channel.force(false);
     }
 
@@ -93,26 +106,18 @@ public class WriteAheadLog implements Closeable {
 
     public void reset() throws IOException {
         checkNotClosed();
-        out.close();
         channel.close();
         Files.deleteIfExists(path);
-        openStream();
+        this.channel = FileChannel.open(path,
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
     }
 
     @Override
     public void close() throws IOException {
         if (!closed) {
             closed = true;
-            out.close();
             channel.close();
         }
-    }
-
-    private void openStream() throws IOException {
-        this.channel = FileChannel.open(path,
-                StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE);
-        this.out = new DataOutputStream(
-                new BufferedOutputStream(new FileOutputStream(path.toFile(), true)));
     }
 
     private void checkNotClosed() throws IOException {

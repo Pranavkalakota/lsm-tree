@@ -246,4 +246,53 @@ class RobustnessTest {
         assertEquals(Optional.empty(), engine.get("anything"));
         engine.close();
     }
+
+    // --- File lock prevents concurrent instances ---
+
+    @Test
+    void twoEnginesOnSameDirectoryThrows() {
+        LSMStoreEngine engine1 = new LSMStoreEngine(tempDir);
+        engine1.put("k", "v");
+
+        // JVM throws OverlappingFileLockException for same-process lock conflicts,
+        // which gets wrapped in UncheckedIOException by our constructor. Cross-process
+        // conflicts would hit the tryLock() == null path instead.
+        assertThrows(Exception.class, () -> new LSMStoreEngine(tempDir),
+                "Second engine on the same directory should fail due to file lock");
+        engine1.close();
+    }
+
+    @Test
+    void lockReleasedAfterClose() {
+        LSMStoreEngine engine1 = new LSMStoreEngine(tempDir);
+        engine1.put("k", "v");
+        engine1.close();
+
+        // After close, another engine should be able to open the same directory
+        LSMStoreEngine engine2 = new LSMStoreEngine(tempDir);
+        assertEquals(Optional.of("v"), engine2.get("k"));
+        engine2.close();
+    }
+
+    // --- WAL doesn't grow without bound across restarts ---
+
+    @Test
+    void walSizeDoesNotGrowAcrossRestarts() {
+        LSMStoreEngine engine1 = new LSMStoreEngine(tempDir);
+        for (int i = 0; i < 100; i++) {
+            engine1.put("key-" + i, "val-" + i);
+        }
+        engine1.close();
+        long walSizeAfterFirstRun = tempDir.resolve("wal.log").toFile().length();
+
+        // Reopen without writing anything new
+        LSMStoreEngine engine2 = new LSMStoreEngine(tempDir);
+        engine2.close();
+        long walSizeAfterReopen = tempDir.resolve("wal.log").toFile().length();
+
+        // WAL should be roughly the same size (re-serialized from MemTable),
+        // not doubled from naive append-on-replay
+        assertEquals(walSizeAfterFirstRun, walSizeAfterReopen,
+                "WAL should not grow on restart without new writes");
+    }
 }

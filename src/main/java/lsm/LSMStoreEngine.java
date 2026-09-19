@@ -6,8 +6,11 @@ import lsm.wal.WriteAheadLog;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Optional;
 
 public class LSMStoreEngine implements StorageEngine {
@@ -17,6 +20,8 @@ public class LSMStoreEngine implements StorageEngine {
     private final MemTable memTable;
     private final WriteAheadLog wal;
     private final Path dataDir;
+    private final FileChannel lockChannel;
+    private final FileLock lock;
     private volatile boolean closed = false;
 
     public LSMStoreEngine(Path dataDir) {
@@ -28,12 +33,37 @@ public class LSMStoreEngine implements StorageEngine {
             this.dataDir = dataDir;
             Files.createDirectories(dataDir);
 
+            // Acquire an exclusive file lock to prevent concurrent engine instances
+            Path lockPath = dataDir.resolve("LOCK");
+            this.lockChannel = FileChannel.open(lockPath,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            this.lock = lockChannel.tryLock();
+            if (this.lock == null) {
+                lockChannel.close();
+                throw new IOException(
+                        "Another engine instance holds the lock on " + dataDir);
+            }
+
             this.memTable = new MemTable(memTableMaxSize);
             Path walPath = dataDir.resolve("wal.log");
 
             WriteAheadLog.replay(walPath, memTable);
 
+            // After successful replay, start a fresh WAL so we don't
+            // re-replay stale entries on the next startup
+            Files.deleteIfExists(walPath);
             this.wal = new WriteAheadLog(walPath);
+
+            // Re-write current MemTable state into the fresh WAL so
+            // crash recovery still works
+            for (var entry : memTable.entries().entrySet()) {
+                Entry e = entry.getValue();
+                if (e.isTombstone()) {
+                    wal.appendDelete(entry.getKey());
+                } else {
+                    wal.appendPut(entry.getKey(), e.value().orElseThrow());
+                }
+            }
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to initialize storage engine", e);
         }
@@ -86,8 +116,10 @@ public class LSMStoreEngine implements StorageEngine {
         closed = true;
         try {
             wal.close();
+            lock.release();
+            lockChannel.close();
         } catch (IOException e) {
-            throw new UncheckedIOException("Failed to close WAL", e);
+            throw new UncheckedIOException("Failed to close engine", e);
         }
     }
 
