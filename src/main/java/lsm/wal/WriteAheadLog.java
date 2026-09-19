@@ -55,26 +55,28 @@ public class WriteAheadLog implements Closeable {
         try (DataInputStream in = new DataInputStream(
                 new BufferedInputStream(new FileInputStream(path.toFile())))) {
             while (in.available() > 0) {
-                byte op;
                 try {
-                    op = in.readByte();
+                    byte op = in.readByte();
+
+                    int keyLen = in.readInt();
+                    byte[] keyBytes = new byte[keyLen];
+                    in.readFully(keyBytes);
+                    String key = new String(keyBytes, StandardCharsets.UTF_8);
+
+                    if (op == OP_PUT) {
+                        int valLen = in.readInt();
+                        byte[] valBytes = new byte[valLen];
+                        in.readFully(valBytes);
+                        String value = new String(valBytes, StandardCharsets.UTF_8);
+                        memTable.put(key, value);
+                    } else if (op == OP_DELETE) {
+                        memTable.delete(key);
+                    }
                 } catch (EOFException e) {
+                    // Truncated record at the end of the WAL — the process crashed
+                    // mid-write. Everything before this point was fully written, so
+                    // we discard the partial tail and recover what we can.
                     break;
-                }
-
-                int keyLen = in.readInt();
-                byte[] keyBytes = new byte[keyLen];
-                in.readFully(keyBytes);
-                String key = new String(keyBytes, StandardCharsets.UTF_8);
-
-                if (op == OP_PUT) {
-                    int valLen = in.readInt();
-                    byte[] valBytes = new byte[valLen];
-                    in.readFully(valBytes);
-                    String value = new String(valBytes, StandardCharsets.UTF_8);
-                    memTable.put(key, value);
-                } else if (op == OP_DELETE) {
-                    memTable.delete(key);
                 }
             }
         }
