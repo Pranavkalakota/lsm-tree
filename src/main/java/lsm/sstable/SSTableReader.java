@@ -182,7 +182,10 @@ public final class SSTableReader implements AutoCloseable {
         Cursor(long start, long end) {
             this.end = end;
             this.next = start;
-            this.buf = ByteBuffer.allocate(SCAN_BUFFER);
+            // Sized to the range actually being read. A fixed buffer would make
+            // every lookup cost the same allocation whether the block holds one
+            // record or a thousand, and a lookup walks every table in the store.
+            this.buf = ByteBuffer.allocate((int) Math.min(SCAN_BUFFER, Math.max(end - start, 0)));
             this.buf.limit(0);
         }
 
