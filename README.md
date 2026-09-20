@@ -91,31 +91,52 @@ watch; the engine's real default is four megabytes.
 
 | Component | State |
 | --- | --- |
-| MemTable | Done |
+| MemTable (skip list) | Done |
 | Write-ahead log, crash recovery | Done |
 | SSTable flush and read path | Done |
+| Block checksums (CRC32C) | Done |
+| Block cache | Done |
+| Concurrent readers and writers | Done |
 | Bloom filters | Planned |
 | Compaction | Planned |
 | Benchmarks | Planned |
 
-Performance targets are **not yet measured**. The engine currently fsyncs on
-every write, which caps throughput near 330 writes/sec on a laptop SSD; a
-configurable durability mode and group commit are the next piece of work.
+Performance targets are **not yet measured**. The engine fsyncs on every
+write, which caps throughput near 330 writes/sec on a laptop SSD. That is a
+deliberate tradeoff for now: durability over speed, with group commit as the
+way out when the number starts to matter.
+
+## Design Notes
+
+**Tables are immutable.** That one property does most of the work: a block's
+bytes can never change, so the cache needs no invalidation protocol, and a
+reader can hold a block indefinitely without coordinating with anything.
+
+**Reads take no locks.** Lookups use positional reads rather than a shared
+file cursor, the table list is copy-on-write, and the MemTable is a skip
+list. A read-write lock would have been simpler and would have blocked every
+reader behind every write.
+
+**Flush ordering carries the crash guarantee.** The table is fsynced and
+renamed before the log is reset, so a crash in the gap leaves the writes
+recoverable from the log. The new table is published before the MemTable is
+cleared, so no reader sees a key exist in neither.
+
+**Deletes are lazy.** A delete writes a tombstone; the old value stays on
+disk until compaction drops it. This keeps writes fast and is why a deleted
+key's bytes are still in the file afterwards.
 
 ## Roadmap
 
-Deliberately deferred, each planned rather than permanent:
-
-- **Concurrent writers** — reads are already safe to share; writes are not
-- **Block checksums** — the SSTable footer carries a format version so this
-  can be added without breaking existing files
-- **Block cache** — decoded blocks are currently re-read on every lookup
 - **Leveled compaction** — size-tiered first, leveled after
+- **Bloom filters** — skip tables that cannot hold the key
+- **Group commit** — amortize fsync across concurrent writers
 
 ## Tech Stack
 
 - Java 17
 - Maven
 - JUnit 5
+- Caffeine (block cache)
 - Guava (Bloom filters)
 - JMH (benchmarking)
