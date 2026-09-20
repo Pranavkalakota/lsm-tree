@@ -3,12 +3,22 @@ package lsm.memtable;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.Map;
-import java.util.TreeMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * The in-memory half of the store: recent writes, held in key order so a flush
+ * can stream them straight out as a sorted table.
+ *
+ * <p>Backed by a skip list rather than a balanced tree so that lookups stay
+ * correct while another thread is writing. Reads need no coordination at all;
+ * writers are expected to be serialized by the engine, which they must be
+ * anyway to keep the write-ahead log in the same order as this map.
+ */
 public class MemTable {
 
-    private final TreeMap<String, Entry> data = new TreeMap<>();
-    private long sizeBytes = 0;
+    private final ConcurrentSkipListMap<String, Entry> data = new ConcurrentSkipListMap<>();
+    private final AtomicLong sizeBytes = new AtomicLong();
     private final long maxSizeBytes;
 
     public MemTable(long maxSizeBytes) {
@@ -16,23 +26,16 @@ public class MemTable {
     }
 
     public void put(String key, String value) {
-        Entry old = data.get(key);
-        if (old != null) {
-            sizeBytes -= keySize(key) + old.sizeBytes();
-        }
         Entry entry = Entry.put(value);
-        data.put(key, entry);
-        sizeBytes += keySize(key) + entry.sizeBytes();
+        Entry previous = data.put(key, entry);
+        sizeBytes.addAndGet(previous == null
+                ? keySize(key) + entry.sizeBytes()
+                : entry.sizeBytes() - previous.sizeBytes());
     }
 
     public void delete(String key) {
-        Entry old = data.get(key);
-        if (old != null) {
-            sizeBytes -= keySize(key) + old.sizeBytes();
-        }
-        Entry tombstone = Entry.tombstone();
-        data.put(key, tombstone);
-        sizeBytes += keySize(key);
+        Entry previous = data.put(key, Entry.tombstone());
+        sizeBytes.addAndGet(previous == null ? keySize(key) : -previous.sizeBytes());
     }
 
     public Entry get(String key) {
@@ -40,11 +43,11 @@ public class MemTable {
     }
 
     public boolean shouldFlush() {
-        return sizeBytes >= maxSizeBytes;
+        return sizeBytes.get() >= maxSizeBytes;
     }
 
     public long getSizeBytes() {
-        return sizeBytes;
+        return sizeBytes.get();
     }
 
     public int entryCount() {
@@ -61,7 +64,7 @@ public class MemTable {
 
     public void clear() {
         data.clear();
-        sizeBytes = 0;
+        sizeBytes.set(0);
     }
 
     private static int keySize(String key) {
