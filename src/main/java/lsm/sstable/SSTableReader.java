@@ -9,28 +9,27 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.zip.CRC32C;
 
 /**
  * Point lookups against an immutable SSTable written by {@link SSTableWriter}.
  *
- * <p>The sparse index is read once at open time and kept in memory. A lookup
- * binary searches it for the block that could hold the key, then scans that
- * block; because the index covers every {@link SSTableWriter#INDEX_INTERVAL}-th
- * key, the scan touches at most that many records no matter how large the
- * table is.
+ * <p>The block index is read once at open time and kept in memory. A lookup
+ * binary searches it for the one block that could hold the key, loads that
+ * block in a single read, checks it against its stored checksum, and scans it.
+ * Because the index names every block, exactly one block is ever loaded per
+ * lookup no matter how large the table is.
  *
  * <p>All file access uses positional reads, so the reader holds no mutable
  * cursor of its own and concurrent lookups on one instance are safe.
  */
 public final class SSTableReader implements AutoCloseable {
 
-    private static final int SCAN_BUFFER = 16 * 1024;
-
     private final Path path;
     private final FileChannel channel;
-    private final String[] indexKeys;
-    private final long[] indexOffsets;
-    private final long dataEnd;
+    private final String[] firstKeys;
+    private final long[] blockOffsets;
+    private final int[] blockLengths;
 
     public SSTableReader(Path path) throws IOException {
         this.path = path;
@@ -43,7 +42,7 @@ public final class SSTableReader implements AutoCloseable {
 
             ByteBuffer footer = read(size - SSTableWriter.FOOTER_SIZE, SSTableWriter.FOOTER_SIZE);
             long indexOffset = footer.getLong();
-            int indexCount = footer.getInt();
+            int blockCount = footer.getInt();
             int version = footer.getInt();
             long magic = footer.getLong();
 
@@ -55,14 +54,14 @@ public final class SSTableReader implements AutoCloseable {
                         + " in " + path);
             }
             long indexEnd = size - SSTableWriter.FOOTER_SIZE;
-            if (indexOffset < 0 || indexOffset > indexEnd || indexCount < 0) {
+            if (indexOffset < 0 || indexOffset > indexEnd || blockCount < 0) {
                 throw new IOException("Corrupt SSTable footer: " + path);
             }
 
-            this.dataEnd = indexOffset;
-            this.indexKeys = new String[indexCount];
-            this.indexOffsets = new long[indexCount];
-            loadIndex(indexOffset, indexEnd, indexCount);
+            this.firstKeys = new String[blockCount];
+            this.blockOffsets = new long[blockCount];
+            this.blockLengths = new int[blockCount];
+            loadIndex(indexOffset, (int) (indexEnd - indexOffset), blockCount, indexOffset);
         } catch (IOException e) {
             channel.close();
             throw e;
@@ -74,38 +73,38 @@ public final class SSTableReader implements AutoCloseable {
      * {@code null} when this table says nothing about the key at all. The two
      * cases are distinct: a tombstone must stop the engine from consulting
      * older tables, whereas an absent key must not.
+     *
+     * @throws IOException if the block holding the key fails its checksum
      */
     public Entry get(String key) throws IOException {
         int slot = indexSlot(key);
         if (slot < 0) {
             return null;
         }
-        long blockEnd = (slot + 1 < indexOffsets.length) ? indexOffsets[slot + 1] : dataEnd;
-        Cursor cursor = new Cursor(indexOffsets[slot], blockEnd);
+        ByteBuffer block = readBlock(slot);
 
-        while (cursor.ensure(4)) {
-            int keyLen = cursor.buffer().getInt();
-            if (!cursor.ensure(keyLen + 5)) {
-                break;
-            }
-            ByteBuffer buf = cursor.buffer();
+        while (block.remaining() > 0) {
+            int keyLen = block.getInt();
             byte[] keyBytes = new byte[keyLen];
-            buf.get(keyBytes);
-            boolean tombstone = buf.get() == 1;
-            int valLen = buf.getInt();
+            block.get(keyBytes);
+            boolean tombstone = block.get() == 1;
+            int valLen = block.getInt();
 
             int cmp = new String(keyBytes, StandardCharsets.UTF_8).compareTo(key);
             if (cmp == 0) {
                 if (tombstone) {
                     return Entry.tombstone();
                 }
-                return Entry.put(new String(read(cursor.offset(), valLen).array(),
-                        StandardCharsets.UTF_8));
+                byte[] val = new byte[valLen];
+                block.get(val);
+                return Entry.put(new String(val, StandardCharsets.UTF_8));
             }
             if (cmp > 0) {
+                // Keys ascend, so anything further in this block is past the
+                // target, and the index guarantees later blocks start later still.
                 return null;
             }
-            cursor.skip(valLen);
+            block.position(block.position() + valLen);
         }
         return null;
     }
@@ -119,36 +118,58 @@ public final class SSTableReader implements AutoCloseable {
         channel.close();
     }
 
-    private void loadIndex(long from, long to, int count) throws IOException {
-        Cursor cursor = new Cursor(from, to);
+    /** Loads one block and rejects it if the bytes disagree with its checksum. */
+    private ByteBuffer readBlock(int slot) throws IOException {
+        int length = blockLengths[slot];
+        ByteBuffer raw = read(blockOffsets[slot], length);
+        int dataLength = length - SSTableWriter.CHECKSUM_SIZE;
+
+        CRC32C crc = new CRC32C();
+        crc.update(raw.array(), 0, dataLength);
+        if ((int) crc.getValue() != raw.getInt(dataLength)) {
+            throw new IOException("Checksum mismatch in block " + slot + " of " + path
+                    + "; the file has been corrupted");
+        }
+        return ByteBuffer.wrap(raw.array(), 0, dataLength);
+    }
+
+    private void loadIndex(long from, int length, int count, long dataEnd) throws IOException {
+        ByteBuffer buf = read(from, length);
         for (int i = 0; i < count; i++) {
-            if (!cursor.ensure(4)) {
+            if (buf.remaining() < 4) {
                 throw new IOException("Truncated SSTable index: " + path);
             }
-            int keyLen = cursor.buffer().getInt();
-            if (keyLen < 0 || !cursor.ensure(keyLen + 8)) {
+            int keyLen = buf.getInt();
+            if (keyLen < 0 || buf.remaining() < keyLen + 12) {
                 throw new IOException("Truncated SSTable index: " + path);
             }
-            ByteBuffer buf = cursor.buffer();
             byte[] keyBytes = new byte[keyLen];
             buf.get(keyBytes);
-            indexKeys[i] = new String(keyBytes, StandardCharsets.UTF_8);
-            indexOffsets[i] = buf.getLong();
+            firstKeys[i] = new String(keyBytes, StandardCharsets.UTF_8);
+            blockOffsets[i] = buf.getLong();
+            blockLengths[i] = buf.getInt();
+
+            if (blockLengths[i] < SSTableWriter.CHECKSUM_SIZE
+                    || blockOffsets[i] < 0
+                    || blockOffsets[i] + blockLengths[i] > dataEnd) {
+                throw new IOException("Corrupt SSTable index entry " + i + " in " + path);
+            }
         }
     }
 
     /**
-     * Index of the last indexed key that is less than or equal to {@code key},
-     * or -1 when {@code key} sorts before every key in the table. Ordering uses
-     * {@link String#compareTo}, matching the TreeMap order the writer relies on.
+     * Index of the last block whose first key is less than or equal to
+     * {@code key}, or -1 when {@code key} sorts before every key in the table.
+     * Ordering uses {@link String#compareTo}, matching the TreeMap order the
+     * writer relies on.
      */
     private int indexSlot(String key) {
         int lo = 0;
-        int hi = indexKeys.length - 1;
+        int hi = firstKeys.length - 1;
         int slot = -1;
         while (lo <= hi) {
             int mid = (lo + hi) >>> 1;
-            if (indexKeys[mid].compareTo(key) <= 0) {
+            if (firstKeys[mid].compareTo(key) <= 0) {
                 slot = mid;
                 lo = mid + 1;
             } else {
@@ -166,71 +187,5 @@ public final class SSTableReader implements AutoCloseable {
             }
         }
         return buf.flip();
-    }
-
-    /**
-     * A forward-only view over a byte range of the file, filled in chunks so a
-     * block scan costs one read rather than one per field. Each lookup makes its
-     * own cursor; the shared channel is only touched through positional reads.
-     */
-    private final class Cursor {
-
-        private final long end;
-        private ByteBuffer buf;
-        private long next;
-
-        Cursor(long start, long end) {
-            this.end = end;
-            this.next = start;
-            // Sized to the range actually being read. A fixed buffer would make
-            // every lookup cost the same allocation whether the block holds one
-            // record or a thousand, and a lookup walks every table in the store.
-            this.buf = ByteBuffer.allocate((int) Math.min(SCAN_BUFFER, Math.max(end - start, 0)));
-            this.buf.limit(0);
-        }
-
-        ByteBuffer buffer() {
-            return buf;
-        }
-
-        /** File offset of the next byte this cursor will hand out. */
-        long offset() {
-            return next - buf.remaining();
-        }
-
-        /** Makes at least {@code n} bytes readable, growing for outsized records. */
-        boolean ensure(int n) throws IOException {
-            if (buf.remaining() >= n) {
-                return true;
-            }
-            if (n > buf.capacity()) {
-                buf = ByteBuffer.allocate(n).put(buf);
-            } else {
-                buf.compact();
-            }
-            while (buf.position() < n && next < end) {
-                int room = (int) Math.min(buf.capacity() - buf.position(), end - next);
-                buf.limit(buf.position() + room);
-                int read = channel.read(buf, next);
-                buf.limit(buf.capacity());
-                if (read < 0) {
-                    break;
-                }
-                next += read;
-            }
-            boolean enough = buf.position() >= n;
-            buf.flip();
-            return enough;
-        }
-
-        void skip(long n) {
-            if (n <= buf.remaining()) {
-                buf.position(buf.position() + (int) n);
-            } else {
-                next = offset() + n;
-                buf.position(0);
-                buf.limit(0);
-            }
-        }
     }
 }

@@ -3,8 +3,11 @@ package lsm.sstable;
 import lsm.memtable.Entry;
 
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -15,28 +18,35 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.zip.CRC32C;
 
 /**
  * Serializes a sorted set of entries into an immutable SSTable file.
  *
  * <pre>
- * [data block]   record*, key-sorted: [keyLen:4][key][tombstone:1][valLen:4][val]
- * [index block]  every INDEX_INTERVAL-th key: [keyLen:4][key][dataOffset:8]
+ * [block]*       records packed to ~BLOCK_SIZE, then [crc32c:4] over them
+ *                record: [keyLen:4][key][tombstone:1][valLen:4][val]
+ * [index block]  one entry per block: [keyLen:4][firstKey][offset:8][length:4]
  * [footer]       [indexOffset:8][indexCount:4][formatVersion:4][magic:8]
  * </pre>
  *
- * The index is sparse so it stays small enough to hold in memory for every open
- * table: one entry per 16 keys costs ~1/16th the RAM of a dense index, and the
- * cost of the linear scan it forces is bounded by those 16 records.
+ * Records are grouped into blocks rather than written as one flat run so that
+ * each block can carry a checksum over exactly the bytes a reader will load,
+ * and so a reader has a natural unit to cache. The index holds one entry per
+ * block, which keeps it small enough to stay resident for every open table.
  */
 public final class SSTableWriter {
 
     /** "LSMSST" plus a two byte tag; trailing bytes of every well-formed file. */
     public static final long MAGIC = 0x4C534D5353543031L;
 
-    public static final int FORMAT_VERSION = 1;
+    /** Bumped from 1 when records were grouped into checksummed blocks. */
+    public static final int FORMAT_VERSION = 2;
     public static final int FOOTER_SIZE = 24;
-    public static final int INDEX_INTERVAL = 16;
+    public static final int CHECKSUM_SIZE = 4;
+
+    /** A block is closed once it passes this; one oversized record may exceed it. */
+    static final int BLOCK_SIZE = 4 * 1024;
 
     private static final int BUFFER_SIZE = 64 * 1024;
     private static final byte[] NO_BYTES = new byte[0];
@@ -70,51 +80,77 @@ public final class SSTableWriter {
         try (FileChannel channel = FileChannel.open(tmp, StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
 
-            DataOutputStream out = new DataOutputStream(
-                    new BufferedOutputStream(Channels.newOutputStream(channel), BUFFER_SIZE));
+            OutputStream out = new BufferedOutputStream(
+                    Channels.newOutputStream(channel), BUFFER_SIZE);
 
-            List<String> indexKeys = new ArrayList<>();
-            List<Long> indexOffsets = new ArrayList<>();
+            List<BlockRef> index = new ArrayList<>();
+            ByteArrayOutputStream block = new ByteArrayOutputStream(BLOCK_SIZE * 2);
+            DataOutputStream blockOut = new DataOutputStream(block);
+            String firstKey = null;
             long offset = 0;
-            int count = 0;
 
             for (Map.Entry<String, Entry> entry : sortedEntries.entrySet()) {
+                if (firstKey == null) {
+                    firstKey = entry.getKey();
+                }
                 byte[] key = entry.getKey().getBytes(StandardCharsets.UTF_8);
                 Entry value = entry.getValue();
                 byte[] val = value.isTombstone()
                         ? NO_BYTES
                         : value.value().orElseThrow().getBytes(StandardCharsets.UTF_8);
 
-                if (count % INDEX_INTERVAL == 0) {
-                    indexKeys.add(entry.getKey());
-                    indexOffsets.add(offset);
+                blockOut.writeInt(key.length);
+                blockOut.write(key);
+                blockOut.writeByte(value.isTombstone() ? 1 : 0);
+                blockOut.writeInt(val.length);
+                blockOut.write(val);
+
+                if (block.size() >= BLOCK_SIZE) {
+                    offset += emitBlock(out, block, index, firstKey, offset);
+                    firstKey = null;
                 }
-
-                out.writeInt(key.length);
-                out.write(key);
-                out.writeByte(value.isTombstone() ? 1 : 0);
-                out.writeInt(val.length);
-                out.write(val);
-
-                offset += 4 + key.length + 1 + 4 + val.length;
-                count++;
+            }
+            if (block.size() > 0) {
+                offset += emitBlock(out, block, index, firstKey, offset);
             }
 
             long indexOffset = offset;
-            for (int i = 0; i < indexKeys.size(); i++) {
-                byte[] key = indexKeys.get(i).getBytes(StandardCharsets.UTF_8);
-                out.writeInt(key.length);
-                out.write(key);
-                out.writeLong(indexOffsets.get(i));
+            DataOutputStream tail = new DataOutputStream(out);
+            for (BlockRef ref : index) {
+                byte[] key = ref.firstKey.getBytes(StandardCharsets.UTF_8);
+                tail.writeInt(key.length);
+                tail.write(key);
+                tail.writeLong(ref.offset);
+                tail.writeInt(ref.length);
             }
 
-            out.writeLong(indexOffset);
-            out.writeInt(indexKeys.size());
-            out.writeInt(FORMAT_VERSION);
-            out.writeLong(MAGIC);
+            tail.writeLong(indexOffset);
+            tail.writeInt(index.size());
+            tail.writeInt(FORMAT_VERSION);
+            tail.writeLong(MAGIC);
 
-            out.flush();
+            tail.flush();
             channel.force(true);
         }
+    }
+
+    /** Appends the pending block plus its checksum, and returns bytes written. */
+    private static int emitBlock(OutputStream out, ByteArrayOutputStream block,
+            List<BlockRef> index, String firstKey, long offset) throws IOException {
+        byte[] bytes = block.toByteArray();
+        block.reset();
+
+        CRC32C crc = new CRC32C();
+        crc.update(bytes);
+
+        out.write(bytes);
+        out.write(ByteBuffer.allocate(CHECKSUM_SIZE).putInt((int) crc.getValue()).array());
+
+        int length = bytes.length + CHECKSUM_SIZE;
+        index.add(new BlockRef(firstKey, offset, length));
+        return length;
+    }
+
+    private record BlockRef(String firstKey, long offset, int length) {
     }
 }
