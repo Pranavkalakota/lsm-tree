@@ -2,6 +2,7 @@ package lsm;
 
 import lsm.memtable.Entry;
 import lsm.memtable.MemTable;
+import lsm.sstable.BlockCache;
 import lsm.sstable.SSTableReader;
 import lsm.sstable.SSTableWriter;
 import lsm.wal.WriteAheadLog;
@@ -23,6 +24,7 @@ import java.util.stream.Stream;
 public class LSMStoreEngine implements StorageEngine {
 
     private static final long DEFAULT_MEMTABLE_SIZE = 4 * 1024 * 1024; // 4 MB
+    private static final long DEFAULT_BLOCK_CACHE_SIZE = 16 * 1024 * 1024; // 16 MB
     private static final String TABLE_SUFFIX = ".sst";
 
     private final MemTable memTable;
@@ -38,6 +40,9 @@ public class LSMStoreEngine implements StorageEngine {
      * a flush prepends to it.
      */
     private final List<SSTableReader> tables = new CopyOnWriteArrayList<>();
+
+    /** Shared by every reader, so the memory bound belongs to the store. */
+    private final BlockCache blockCache = new BlockCache(DEFAULT_BLOCK_CACHE_SIZE);
 
     private long nextSequence = 0;
 
@@ -185,7 +190,7 @@ public class LSMStoreEngine implements StorageEngine {
         SSTableWriter.write(path, memTable.entries());
         syncDirectory();
 
-        tables.add(0, new SSTableReader(path));
+        tables.add(0, new SSTableReader(path, blockCache));
         nextSequence++;
         memTable.clear();
         wal.reset();
@@ -211,7 +216,7 @@ public class LSMStoreEngine implements StorageEngine {
 
         found.sort(Comparator.comparingLong(LSMStoreEngine::sequenceOf).reversed());
         for (Path path : found) {
-            tables.add(new SSTableReader(path));
+            tables.add(new SSTableReader(path, blockCache));
             nextSequence = Math.max(nextSequence, sequenceOf(path) + 1);
         }
     }

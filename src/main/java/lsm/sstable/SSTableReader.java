@@ -27,12 +27,19 @@ public final class SSTableReader implements AutoCloseable {
 
     private final Path path;
     private final FileChannel channel;
+    private final BlockCache cache;
     private final String[] firstKeys;
     private final long[] blockOffsets;
     private final int[] blockLengths;
 
+    /** Opens a reader with its own private cache; convenient for tests. */
     public SSTableReader(Path path) throws IOException {
+        this(path, new BlockCache(SSTableWriter.BLOCK_SIZE * 8L));
+    }
+
+    public SSTableReader(Path path, BlockCache cache) throws IOException {
         this.path = path;
+        this.cache = cache;
         this.channel = FileChannel.open(path, StandardOpenOption.READ);
         try {
             long size = channel.size();
@@ -118,10 +125,23 @@ public final class SSTableReader implements AutoCloseable {
         channel.close();
     }
 
-    /** Loads one block and rejects it if the bytes disagree with its checksum. */
+    /**
+     * Returns the records of one block, from cache when resident.
+     *
+     * <p>The checksum is verified where the bytes are read, so a cache hit
+     * skips it: the block was already proven intact on the way in, and tables
+     * are immutable so it cannot have changed since. The buffer is a fresh
+     * view over shared bytes, giving each caller its own scan position.
+     */
     private ByteBuffer readBlock(int slot) throws IOException {
+        long offset = blockOffsets[slot];
+        byte[] records = cache.get(path, offset, () -> loadAndVerify(slot, offset));
+        return ByteBuffer.wrap(records);
+    }
+
+    private byte[] loadAndVerify(int slot, long offset) throws IOException {
         int length = blockLengths[slot];
-        ByteBuffer raw = read(blockOffsets[slot], length);
+        ByteBuffer raw = read(offset, length);
         int dataLength = length - SSTableWriter.CHECKSUM_SIZE;
 
         CRC32C crc = new CRC32C();
@@ -130,7 +150,9 @@ public final class SSTableReader implements AutoCloseable {
             throw new IOException("Checksum mismatch in block " + slot + " of " + path
                     + "; the file has been corrupted");
         }
-        return ByteBuffer.wrap(raw.array(), 0, dataLength);
+        byte[] records = new byte[dataLength];
+        System.arraycopy(raw.array(), 0, records, 0, dataLength);
+        return records;
     }
 
     private void loadIndex(long from, int length, int count, long dataEnd) throws IOException {
