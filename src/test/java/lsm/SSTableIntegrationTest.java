@@ -6,7 +6,11 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Random;
+import java.util.concurrent.*;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -203,5 +207,94 @@ class SSTableIntegrationTest {
     void refusesToStartOnAnUnreadableTable() throws IOException {
         Files.write(dir.resolve("L0_000000.sst"), new byte[] {9, 9, 9});
         assertThrows(RuntimeException.class, () -> new LSMStoreEngine(dir));
+    }
+
+    // --- concurrency ---
+
+    @Test
+    void concurrentReadsAgainstTablesAgree() throws Exception {
+        LSMStoreEngine engine = new LSMStoreEngine(dir, 512);
+        for (int i = 0; i < 400; i++) {
+            engine.put("key_" + i, "value_" + i);
+        }
+
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        try {
+            CountDownLatch start = new CountDownLatch(1);
+            Callable<Void> reader = () -> {
+                start.await();
+                for (int round = 0; round < 20; round++) {
+                    for (int i = 0; i < 400; i++) {
+                        assertEquals(Optional.of("value_" + i), engine.get("key_" + i));
+                    }
+                }
+                return null;
+            };
+
+            // submit rather than invokeAll: invokeAll blocks until every task
+            // finishes, so the latch below would never be released.
+            var futures = new java.util.ArrayList<Future<Void>>();
+            for (int i = 0; i < 8; i++) {
+                futures.add(pool.submit(reader));
+            }
+            start.countDown();
+            for (Future<Void> future : futures) {
+                future.get(60, TimeUnit.SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
+            engine.close();
+        }
+    }
+
+    // --- scale and randomised behaviour ---
+
+    @Test
+    void servesManyKeysSpreadOverManyTables() {
+        // Kept modest on purpose: every write costs an fsync in the WAL, which
+        // bounds this at a few hundred writes a second. Larger runs belong in a
+        // benchmark, not the unit suite.
+        LSMStoreEngine engine = new LSMStoreEngine(dir, 4 * 1024);
+        for (int i = 0; i < 2_000; i++) {
+            engine.put("key_" + i, "value_" + i);
+        }
+        engine.close();
+
+        LSMStoreEngine reopened = new LSMStoreEngine(dir);
+        for (int i = 0; i < 2_000; i++) {
+            assertEquals(Optional.of("value_" + i), reopened.get("key_" + i),
+                    "lost key_" + i);
+        }
+        reopened.close();
+    }
+
+    @Test
+    void matchesAReferenceMapUnderRandomisedRestarts() {
+        Map<String, String> expected = new HashMap<>();
+        Random random = new Random(20250920L);
+
+        for (int session = 0; session < 4; session++) {
+            LSMStoreEngine engine = new LSMStoreEngine(dir, 512);
+            for (int op = 0; op < 150; op++) {
+                String key = "key_" + random.nextInt(150);
+                if (random.nextDouble() < 0.3) {
+                    engine.delete(key);
+                    expected.remove(key);
+                } else {
+                    String value = "value_" + random.nextInt(1_000_000);
+                    engine.put(key, value);
+                    expected.put(key, value);
+                }
+            }
+            engine.close();
+        }
+
+        LSMStoreEngine engine = new LSMStoreEngine(dir);
+        for (int i = 0; i < 150; i++) {
+            String key = "key_" + i;
+            assertEquals(Optional.ofNullable(expected.get(key)), engine.get(key),
+                    "disagreement on " + key);
+        }
+        engine.close();
     }
 }
