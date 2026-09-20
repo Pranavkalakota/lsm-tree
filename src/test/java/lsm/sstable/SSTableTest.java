@@ -239,6 +239,90 @@ class SSTableTest {
         }
     }
 
+    // --- block checksums ---
+
+    private static TreeMap<String, Entry> manyEntries(int count) {
+        TreeMap<String, Entry> map = new TreeMap<>();
+        for (int i = 0; i < count; i++) {
+            map.put(String.format("key_%05d", i), Entry.put("value_" + i));
+        }
+        return map;
+    }
+
+    private int blockCount(Path path) throws IOException {
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+            ByteBuffer footer = ByteBuffer.allocate(SSTableWriter.FOOTER_SIZE);
+            channel.read(footer, channel.size() - SSTableWriter.FOOTER_SIZE);
+            footer.flip();
+            footer.getLong();
+            return footer.getInt();
+        }
+    }
+
+    @Test
+    void splitsLargeTablesAcrossSeveralBlocks() throws IOException {
+        Path path = write(manyEntries(2_000));
+        assertTrue(blockCount(path) > 1,
+                "2000 records should not fit in a single " + SSTableWriter.BLOCK_SIZE + " byte block");
+    }
+
+    @Test
+    void findsEveryKeyAcrossBlockBoundaries() throws IOException {
+        Path path = write(manyEntries(2_000));
+        try (SSTableReader reader = new SSTableReader(path)) {
+            for (int i = 0; i < 2_000; i++) {
+                assertEquals("value_" + i,
+                        reader.get(String.format("key_%05d", i)).value().orElseThrow(),
+                        "lost key at position " + i);
+            }
+        }
+    }
+
+    @Test
+    void detectsAFlippedBitInBlockData() throws IOException {
+        Path path = write(manyEntries(500));
+        byte[] bytes = Files.readAllBytes(path);
+        // Land inside the first block's records, well clear of index and footer.
+        bytes[64] ^= 0x01;
+        Files.write(path, bytes);
+
+        try (SSTableReader reader = new SSTableReader(path)) {
+            IOException failure = assertThrows(IOException.class, () -> reader.get("key_00000"));
+            assertTrue(failure.getMessage().contains("Checksum"),
+                    "expected a checksum failure, got: " + failure.getMessage());
+        }
+    }
+
+    @Test
+    void detectsACorruptedChecksumItself() throws IOException {
+        Path path = write(entries("only", "record"));
+        byte[] bytes = Files.readAllBytes(path);
+        // Sole block ends at the index; its checksum is the 4 bytes before that.
+        int indexStart = bytes.length - SSTableWriter.FOOTER_SIZE - (4 + "only".length() + 12);
+        bytes[indexStart - 1] ^= 0x01;
+        Files.write(path, bytes);
+
+        try (SSTableReader reader = new SSTableReader(path)) {
+            assertThrows(IOException.class, () -> reader.get("only"));
+        }
+    }
+
+    @Test
+    void corruptionInOneBlockLeavesOthersReadable() throws IOException {
+        Path path = write(manyEntries(2_000));
+        assertTrue(blockCount(path) > 1);
+
+        byte[] bytes = Files.readAllBytes(path);
+        bytes[64] ^= 0x01;
+        Files.write(path, bytes);
+
+        try (SSTableReader reader = new SSTableReader(path)) {
+            assertThrows(IOException.class, () -> reader.get("key_00000"));
+            // A later block is untouched and must still answer.
+            assertEquals("value_1999", reader.get("key_01999").value().orElseThrow());
+        }
+    }
+
     @Test
     void openFailureDoesNotLeakTheChannel() throws IOException {
         Path path = dir.resolve("broken.sst");
