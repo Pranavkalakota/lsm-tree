@@ -19,6 +19,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
 public class LSMStoreEngine implements StorageEngine {
@@ -44,7 +45,15 @@ public class LSMStoreEngine implements StorageEngine {
     /** Shared by every reader, so the memory bound belongs to the store. */
     private final BlockCache blockCache = new BlockCache(DEFAULT_BLOCK_CACHE_SIZE);
 
-    private long nextSequence = 0;
+    /**
+     * Serializes writers. The log and the MemTable have to agree on the order
+     * writes happened, so appending and inserting cannot be interleaved by two
+     * threads; a flush needs the same exclusion while it drains the MemTable.
+     * Readers never take this.
+     */
+    private final ReentrantLock writeLock = new ReentrantLock();
+
+    private volatile long nextSequence = 0;
 
     public LSMStoreEngine(Path dataDir) {
         this(dataDir, DEFAULT_MEMTABLE_SIZE);
@@ -95,15 +104,20 @@ public class LSMStoreEngine implements StorageEngine {
 
     @Override
     public void put(String key, String value) {
-        checkNotClosed();
         if (key == null) throw new IllegalArgumentException("key must not be null");
         if (value == null) throw new IllegalArgumentException("value must not be null");
+        writeLock.lock();
         try {
+            // Checked under the lock: otherwise a close running alongside this
+            // could slip between the check and the append.
+            checkNotClosed();
             wal.appendPut(key, value);
             memTable.put(key, value);
             flushIfFull();
         } catch (IOException e) {
             throw new UncheckedIOException("Write failed", e);
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -136,19 +150,32 @@ public class LSMStoreEngine implements StorageEngine {
 
     @Override
     public void delete(String key) {
-        checkNotClosed();
         if (key == null) throw new IllegalArgumentException("key must not be null");
+        writeLock.lock();
         try {
+            checkNotClosed();
             wal.appendDelete(key);
             memTable.delete(key);
             flushIfFull();
         } catch (IOException e) {
             throw new UncheckedIOException("Write failed", e);
+        } finally {
+            writeLock.unlock();
         }
     }
 
     @Override
     public void close() {
+        writeLock.lock();
+        try {
+            closeUnderLock();
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /** Waits for any write in flight rather than closing the log underneath it. */
+    private void closeUnderLock() {
         if (closed) return;
         closed = true;
         try {
