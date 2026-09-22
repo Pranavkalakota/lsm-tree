@@ -93,6 +93,7 @@ watch; the engine's real default is four megabytes.
 | --- | --- |
 | MemTable (skip list) | Done |
 | Write-ahead log, crash recovery | Done |
+| Durability modes, group commit | Done |
 | SSTable flush and read path | Done |
 | Block checksums (CRC32C) | Done |
 | Block cache | Done |
@@ -101,10 +102,35 @@ watch; the engine's real default is four megabytes.
 | Compaction | Planned |
 | Benchmarks | Planned |
 
-Performance targets are **not yet measured**. The engine fsyncs on every
-write, which caps throughput near 330 writes/sec on a laptop SSD. That is a
-deliberate tradeoff for now: durability over speed, with group commit as the
-way out when the number starts to matter.
+## Write Throughput
+
+```bash
+mvn -q compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+java -cp "target/classes:$(cat target/cp.txt)" lsm.Benchmark
+```
+
+Measured on an M-series laptop SSD:
+
+| Mode | Writers | writes/sec | Survives |
+| --- | ---: | ---: | --- |
+| BUFFERED | 1 | 455,000 | process crash |
+| BUFFERED | 8 | 349,000 | process crash |
+| SYNC | 1 | 263 | power loss |
+| SYNC | 8 | 854 | power loss |
+
+`BUFFERED` is the default and returns once the bytes reach the operating
+system. `SYNC` waits for the disk on every write, which costs ~3.8ms and is
+the entire difference between the two rows.
+
+Two things in that table are worth reading carefully. **SYNC at eight writers
+is 3.2x SYNC at one** — that is group commit: one fsync commits every record
+appended before it, so writers arriving during a commit ride along with it.
+Before that existed, eight writers measured 262/sec against one writer's 266,
+which is to say concurrency bought nothing at all.
+
+**BUFFERED gets slower with more writers,** 349K against 455K. With no fsync
+to hide behind, the single write lock becomes the bottleneck and threads
+simply contend for it. Sharding the log would be the fix; it is not built.
 
 ## Design Notes
 
@@ -130,7 +156,7 @@ key's bytes are still in the file afterwards.
 
 - **Leveled compaction** — size-tiered first, leveled after
 - **Bloom filters** — skip tables that cannot hold the key
-- **Group commit** — amortize fsync across concurrent writers
+- **Sharded write path** — a single lock currently caps buffered throughput
 
 ## Tech Stack
 
