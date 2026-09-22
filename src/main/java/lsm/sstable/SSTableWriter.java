@@ -28,8 +28,15 @@ import java.util.zip.CRC32C;
  * [block]*       records packed to ~BLOCK_SIZE, then [crc32c:4] over them
  *                record: [keyLen:4][key][tombstone:1][valLen:4][val]
  * [index block]  one entry per block: [keyLen:4][firstKey][offset:8][length:4]
- * [footer]       [indexOffset:8][blockCount:4][formatVersion:4][magic:8]
+ * [metadata]     [maxKeyLen:4][maxKey]
+ * [footer]       [indexOffset:8][blockCount:4][metaOffset:8][formatVersion:4][magic:8]
  * </pre>
+ *
+ * The largest key is recorded explicitly because compaction needs each table's
+ * range to decide what overlaps what. The smallest key is already the first
+ * index entry, but the largest lives in the final data block, and reading a
+ * data block just to open a table would both slow startup and make a table with
+ * one corrupt block impossible to open at all.
  *
  * Records are grouped into blocks rather than written as one flat run so each
  * block can carry a checksum over exactly the bytes a reader will load, and so
@@ -50,8 +57,8 @@ public final class SSTableWriter implements Closeable {
     /** "LSMSST" plus a two byte tag; trailing bytes of every well-formed file. */
     public static final long MAGIC = 0x4C534D5353543031L;
 
-    public static final int FORMAT_VERSION = 2;
-    public static final int FOOTER_SIZE = 24;
+    public static final int FORMAT_VERSION = 3;
+    public static final int FOOTER_SIZE = 32;
     public static final int CHECKSUM_SIZE = 4;
 
     /** A block is closed once it passes this; one oversized record may exceed it. */
@@ -143,6 +150,7 @@ public final class SSTableWriter implements Closeable {
         }
 
         long indexOffset = offset;
+        long indexBytes = 0;
         DataOutputStream tail = new DataOutputStream(out);
         for (BlockRef ref : index) {
             byte[] key = ref.firstKey.getBytes(StandardCharsets.UTF_8);
@@ -150,10 +158,18 @@ public final class SSTableWriter implements Closeable {
             tail.write(key);
             tail.writeLong(ref.offset);
             tail.writeInt(ref.length);
+            indexBytes += 4 + key.length + 8 + 4;
         }
+
+        byte[] maxKey = lastKey == null
+                ? NO_BYTES
+                : lastKey.getBytes(StandardCharsets.UTF_8);
+        tail.writeInt(maxKey.length);
+        tail.write(maxKey);
 
         tail.writeLong(indexOffset);
         tail.writeInt(index.size());
+        tail.writeLong(indexOffset + indexBytes);
         tail.writeInt(FORMAT_VERSION);
         tail.writeLong(MAGIC);
 

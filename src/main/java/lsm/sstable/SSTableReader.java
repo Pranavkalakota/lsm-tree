@@ -7,8 +7,11 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.CRC32C;
 
 /**
@@ -32,6 +35,23 @@ public final class SSTableReader implements AutoCloseable {
     private final long[] blockOffsets;
     private final int[] blockLengths;
 
+    private final int level;
+    private final long sequence;
+    private final String minKey;
+    private final String maxKey;
+
+    /**
+     * Readers currently using this table, plus one held by the engine while the
+     * table is live. Compaction drops the engine's reference; the file is closed
+     * and unlinked only when the last in-flight lookup lets go, so a read that
+     * started before a compaction finishes still completes against real bytes.
+     */
+    private final AtomicInteger refs = new AtomicInteger(1);
+
+    /** True until either close() or retire() hands back the engine's reference. */
+    private final AtomicBoolean engineReferenceHeld = new AtomicBoolean(true);
+    private volatile boolean retired;
+
     /** Opens a reader with its own private cache; convenient for tests. */
     public SSTableReader(Path path) throws IOException {
         this(path, new BlockCache(SSTableWriter.BLOCK_SIZE * 8L));
@@ -50,6 +70,7 @@ public final class SSTableReader implements AutoCloseable {
             ByteBuffer footer = read(size - SSTableWriter.FOOTER_SIZE, SSTableWriter.FOOTER_SIZE);
             long indexOffset = footer.getLong();
             int blockCount = footer.getInt();
+            long metaOffset = footer.getLong();
             int version = footer.getInt();
             long magic = footer.getLong();
 
@@ -60,18 +81,71 @@ public final class SSTableReader implements AutoCloseable {
                 throw new IOException("Unsupported SSTable format version " + version
                         + " in " + path);
             }
-            long indexEnd = size - SSTableWriter.FOOTER_SIZE;
-            if (indexOffset < 0 || indexOffset > indexEnd || blockCount < 0) {
+            long metaEnd = size - SSTableWriter.FOOTER_SIZE;
+            if (indexOffset < 0 || indexOffset > metaOffset || metaOffset > metaEnd
+                    || blockCount < 0) {
                 throw new IOException("Corrupt SSTable footer: " + path);
             }
 
             this.firstKeys = new String[blockCount];
             this.blockOffsets = new long[blockCount];
             this.blockLengths = new int[blockCount];
-            loadIndex(indexOffset, (int) (indexEnd - indexOffset), blockCount, indexOffset);
+            loadIndex(indexOffset, (int) (metaOffset - indexOffset), blockCount, indexOffset);
+
+            this.level = parseLevel(path);
+            this.sequence = parseSequence(path);
+            this.minKey = blockCount == 0 ? null : firstKeys[0];
+            this.maxKey = readMaxKey(metaOffset, (int) (metaEnd - metaOffset));
         } catch (IOException e) {
             channel.close();
             throw e;
+        }
+    }
+
+    /** Reads the stored largest key, or null for an empty table. */
+    private String readMaxKey(long from, int length) throws IOException {
+        if (length < 4) {
+            throw new IOException("Corrupt SSTable metadata: " + path);
+        }
+        ByteBuffer meta = read(from, length);
+        int keyLen = meta.getInt();
+        if (keyLen < 0 || keyLen > meta.remaining()) {
+            throw new IOException("Corrupt SSTable metadata: " + path);
+        }
+        if (keyLen == 0) {
+            return null;
+        }
+        byte[] keyBytes = new byte[keyLen];
+        meta.get(keyBytes);
+        return new String(keyBytes, StandardCharsets.UTF_8);
+    }
+
+    /** Level from an {@code L<level>_<sequence>.sst} name, or 0 for other names. */
+    private static int parseLevel(Path path) {
+        String name = path.getFileName().toString();
+        int underscore = name.indexOf('_');
+        if (!name.startsWith("L") || underscore < 0) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(name.substring(1, underscore));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    /** Sequence from the file name, or 0 when the name does not carry one. */
+    private static long parseSequence(Path path) {
+        String name = path.getFileName().toString();
+        int underscore = name.indexOf('_');
+        int dot = name.lastIndexOf('.');
+        if (underscore < 0 || dot < underscore) {
+            return 0;
+        }
+        try {
+            return Long.parseLong(name.substring(underscore + 1, dot));
+        } catch (NumberFormatException e) {
+            return 0;
         }
     }
 
@@ -123,6 +197,85 @@ public final class SSTableReader implements AutoCloseable {
     /** Number of blocks in this table. */
     public int blockCount() {
         return blockOffsets.length;
+    }
+
+    public int level() {
+        return level;
+    }
+
+    public long sequence() {
+        return sequence;
+    }
+
+    /** Smallest key present, or null when the table is empty. */
+    public String minKey() {
+        return minKey;
+    }
+
+    /** Largest key present, or null when the table is empty. */
+    public String maxKey() {
+        return maxKey;
+    }
+
+    public long sizeBytes() throws IOException {
+        return channel.size();
+    }
+
+    /** Whether this table's key range intersects [lo, hi], both inclusive. */
+    public boolean overlaps(String lo, String hi) {
+        if (minKey == null) {
+            return false;
+        }
+        return minKey.compareTo(hi) <= 0 && maxKey.compareTo(lo) >= 0;
+    }
+
+    /**
+     * Takes a reference for the duration of a lookup, returning false if the
+     * table has already been retired and its last reader has gone. Callers that
+     * get true must {@link #release} in a finally block.
+     */
+    public boolean acquire() {
+        while (true) {
+            int current = refs.get();
+            if (current == 0) {
+                return false;
+            }
+            if (refs.compareAndSet(current, current + 1)) {
+                return true;
+            }
+        }
+    }
+
+    /** Drops a reference, closing and deleting the file if it was the last one. */
+    public void release() {
+        if (refs.decrementAndGet() == 0) {
+            dispose();
+        }
+    }
+
+    /**
+     * Marks the table as replaced by a compaction and drops the engine's
+     * reference. The file survives until in-flight readers finish with it.
+     */
+    public void retire() {
+        if (engineReferenceHeld.compareAndSet(true, false)) {
+            // Set before releasing: the release may be the last one, and
+            // dispose() consults this to decide whether to unlink.
+            retired = true;
+            release();
+        }
+    }
+
+    private void dispose() {
+        try {
+            channel.close();
+            if (retired) {
+                Files.deleteIfExists(path);
+            }
+        } catch (IOException e) {
+            // Nothing useful to do: the table is already out of the read path,
+            // and a file left behind is swept on the next startup.
+        }
     }
 
     /**
@@ -194,9 +347,12 @@ public final class SSTableReader implements AutoCloseable {
         }
     }
 
+    /** Drops the engine's reference, leaving the file on disk. Idempotent. */
     @Override
-    public void close() throws IOException {
-        channel.close();
+    public void close() {
+        if (engineReferenceHeld.compareAndSet(true, false)) {
+            release();
+        }
     }
 
     /**

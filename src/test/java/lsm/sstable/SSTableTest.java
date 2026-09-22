@@ -187,8 +187,9 @@ class SSTableTest {
             ByteBuffer footer = ByteBuffer.allocate(SSTableWriter.FOOTER_SIZE);
             channel.read(footer, channel.size() - SSTableWriter.FOOTER_SIZE);
             footer.flip();
-            footer.getLong();
-            footer.getInt();
+            footer.getLong();   // indexOffset
+            footer.getInt();    // blockCount
+            footer.getLong();   // metaOffset
             assertEquals(SSTableWriter.FORMAT_VERSION, footer.getInt());
             assertEquals(SSTableWriter.MAGIC, footer.getLong());
         }
@@ -297,8 +298,13 @@ class SSTableTest {
     void detectsACorruptedChecksumItself() throws IOException {
         Path path = write(entries("only", "record"));
         byte[] bytes = Files.readAllBytes(path);
-        // Sole block ends at the index; its checksum is the 4 bytes before that.
-        int indexStart = bytes.length - SSTableWriter.FOOTER_SIZE - (4 + "only".length() + 12);
+
+        // The sole block runs up to the index, so its checksum is the four
+        // bytes immediately before indexOffset. Read that from the footer
+        // rather than deriving it, so the test survives layout changes.
+        ByteBuffer footer = ByteBuffer.wrap(bytes, bytes.length - SSTableWriter.FOOTER_SIZE,
+                SSTableWriter.FOOTER_SIZE);
+        int indexStart = (int) footer.getLong();
         bytes[indexStart - 1] ^= 0x01;
         Files.write(path, bytes);
 
