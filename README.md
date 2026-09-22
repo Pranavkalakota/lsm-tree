@@ -38,8 +38,8 @@ public interface StorageEngine {
 
 ## Components
 
-- **MemTable** — In-memory sorted structure (TreeMap) holding recent writes. Tracks size and triggers flush when threshold is exceeded.
-- **Write-Ahead Log (WAL)** — Append-only log ensuring crash safety. Every write hits the WAL before the MemTable.
+- **MemTable** — In-memory sorted structure (skip list) holding recent writes. Tracks size and triggers flush when threshold is exceeded.
+- **Write-Ahead Log (WAL)** — Append-only log ensuring crash safety. Every write hits the WAL before the MemTable, under a configurable durability mode.
 - **SSTable** — Immutable sorted files on disk with a sparse index for efficient lookups.
 - **Bloom Filter** — Probabilistic filter per SSTable to skip unnecessary disk reads.
 - **Compaction** — Background merging of SSTables across levels, dropping stale keys and tombstones.
@@ -98,9 +98,10 @@ watch; the engine's real default is four megabytes.
 | Block checksums (CRC32C) | Done |
 | Block cache | Done |
 | Concurrent readers and writers | Done |
+| Write throughput benchmark | Done |
 | Bloom filters | Planned |
 | Compaction | Planned |
-| Benchmarks | Planned |
+| Read latency benchmark | Planned |
 
 ## Write Throughput
 
