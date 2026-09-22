@@ -120,6 +120,80 @@ public final class SSTableReader implements AutoCloseable {
         return path;
     }
 
+    /** Number of blocks in this table. */
+    public int blockCount() {
+        return blockOffsets.length;
+    }
+
+    /**
+     * Walks every entry in key order, tombstones included.
+     *
+     * <p>Compaction reads whole tables this way rather than through {@link #get},
+     * so it streams block by block and never holds more than one block of the
+     * table in memory. Tombstones are surfaced because only the caller knows
+     * whether an older table below still needs shadowing.
+     */
+    public Cursor cursor() throws IOException {
+        return new Cursor();
+    }
+
+    /** One entry of a table: the key, and the value or tombstone stored for it. */
+    public record Row(String key, Entry value) {
+    }
+
+    /** Forward-only walk over a table's entries. Not thread safe; make one per scan. */
+    public final class Cursor {
+
+        private int block = -1;
+        private ByteBuffer records = ByteBuffer.allocate(0);
+        private Row current;
+
+        private Cursor() throws IOException {
+            advance();
+        }
+
+        /** The entry the cursor sits on, or null once the table is exhausted. */
+        public Row current() {
+            return current;
+        }
+
+        public boolean hasNext() {
+            return current != null;
+        }
+
+        /** Moves to the next entry, returning the one just passed. */
+        public Row next() throws IOException {
+            Row row = current;
+            advance();
+            return row;
+        }
+
+        private void advance() throws IOException {
+            while (!records.hasRemaining()) {
+                if (++block >= blockOffsets.length) {
+                    current = null;
+                    return;
+                }
+                records = readBlock(block);
+            }
+
+            int keyLen = records.getInt();
+            byte[] keyBytes = new byte[keyLen];
+            records.get(keyBytes);
+            boolean tombstone = records.get() == 1;
+            int valLen = records.getInt();
+
+            String key = new String(keyBytes, StandardCharsets.UTF_8);
+            if (tombstone) {
+                current = new Row(key, Entry.tombstone());
+                return;
+            }
+            byte[] val = new byte[valLen];
+            records.get(val);
+            current = new Row(key, Entry.put(new String(val, StandardCharsets.UTF_8)));
+        }
+    }
+
     @Override
     public void close() throws IOException {
         channel.close();
