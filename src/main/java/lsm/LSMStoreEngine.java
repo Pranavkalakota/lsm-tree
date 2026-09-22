@@ -5,6 +5,7 @@ import lsm.memtable.MemTable;
 import lsm.sstable.BlockCache;
 import lsm.sstable.SSTableReader;
 import lsm.sstable.SSTableWriter;
+import lsm.wal.DurabilityMode;
 import lsm.wal.WriteAheadLog;
 
 import java.io.IOException;
@@ -60,6 +61,10 @@ public class LSMStoreEngine implements StorageEngine {
     }
 
     public LSMStoreEngine(Path dataDir, long memTableMaxSize) {
+        this(dataDir, memTableMaxSize, DurabilityMode.BUFFERED);
+    }
+
+    public LSMStoreEngine(Path dataDir, long memTableMaxSize, DurabilityMode durability) {
         try {
             this.dataDir = dataDir;
             Files.createDirectories(dataDir);
@@ -85,7 +90,7 @@ public class LSMStoreEngine implements StorageEngine {
             // After successful replay, start a fresh WAL so we don't
             // re-replay stale entries on the next startup
             Files.deleteIfExists(walPath);
-            this.wal = new WriteAheadLog(walPath);
+            this.wal = new WriteAheadLog(walPath, durability);
 
             // Re-write current MemTable state into the fresh WAL so
             // crash recovery still works
@@ -106,19 +111,7 @@ public class LSMStoreEngine implements StorageEngine {
     public void put(String key, String value) {
         if (key == null) throw new IllegalArgumentException("key must not be null");
         if (value == null) throw new IllegalArgumentException("value must not be null");
-        writeLock.lock();
-        try {
-            // Checked under the lock: otherwise a close running alongside this
-            // could slip between the check and the append.
-            checkNotClosed();
-            wal.appendPut(key, value);
-            memTable.put(key, value);
-            flushIfFull();
-        } catch (IOException e) {
-            throw new UncheckedIOException("Write failed", e);
-        } finally {
-            writeLock.unlock();
-        }
+        commit(key, value, true);
     }
 
     @Override
@@ -151,16 +144,44 @@ public class LSMStoreEngine implements StorageEngine {
     @Override
     public void delete(String key) {
         if (key == null) throw new IllegalArgumentException("key must not be null");
+        commit(key, null, false);
+    }
+
+    /**
+     * Applies one write, then commits it.
+     *
+     * <p>The append and the MemTable insert happen under the lock because the
+     * log has to record them in the order the MemTable accepted them. The
+     * commit deliberately happens outside it: an fsync takes milliseconds, and
+     * holding the lock across it would force every other writer to wait out a
+     * disk round trip that would have covered their record too. Released early,
+     * they pile into the same fsync instead.
+     */
+    private void commit(String key, String value, boolean isPut) {
+        long seq;
         writeLock.lock();
         try {
+            // Checked under the lock: otherwise a close running alongside this
+            // could slip between the check and the append.
             checkNotClosed();
-            wal.appendDelete(key);
-            memTable.delete(key);
+            if (isPut) {
+                seq = wal.appendPut(key, value);
+                memTable.put(key, value);
+            } else {
+                seq = wal.appendDelete(key);
+                memTable.delete(key);
+            }
             flushIfFull();
         } catch (IOException e) {
             throw new UncheckedIOException("Write failed", e);
         } finally {
             writeLock.unlock();
+        }
+
+        try {
+            wal.syncTo(seq);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Write failed to commit", e);
         }
     }
 
