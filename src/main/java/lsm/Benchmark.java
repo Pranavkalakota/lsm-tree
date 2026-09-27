@@ -1,8 +1,15 @@
 package lsm;
 
+import lsm.memtable.Entry;
+import lsm.sstable.SSTableReader;
+import lsm.sstable.SSTableWriter;
 import lsm.wal.DurabilityMode;
 
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.Optional;
+import java.util.TreeMap;
+import java.util.function.IntConsumer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -43,6 +50,9 @@ public final class Benchmark {
      */
     private static final long MEMTABLE = Long.getLong("bench.memtable", 64L * 1024 * 1024);
 
+    private static final int READ_KEYS = Integer.getInteger("bench.read.keys", 100_000);
+    private static final int READ_OPS = Integer.getInteger("bench.read.ops", 100_000);
+
     private static final Path DIR = Path.of(System.getProperty(
             "bench.dir", System.getProperty("java.io.tmpdir") + "/lsm-benchmark"));
 
@@ -57,6 +67,9 @@ public final class Benchmark {
         run(DurabilityMode.SYNC, 1);
         run(DurabilityMode.SYNC, 8);
 
+        reads();
+        bloomComparison();
+
         System.out.println("""
 
                 BUFFERED returns once the bytes reach the operating system, so a
@@ -68,6 +81,130 @@ public final class Benchmark {
                 so writers that arrive during a commit ride along with it.""");
 
         delete(DIR);
+    }
+
+    /** Read throughput and tail latency against a compacted store. */
+    private static void reads() throws Exception {
+        System.out.printf("%n%,d keys, read after compaction%n%n", READ_KEYS);
+        System.out.printf("%-28s %12s   %10s   %10s%n",
+                "lookup", "reads/sec", "p50", "p99");
+        System.out.println("-".repeat(68));
+
+        delete(DIR);
+        LSMStoreEngine engine = new LSMStoreEngine(DIR, 4L * 1024 * 1024);
+        try {
+            for (int i = 0; i < READ_KEYS; i++) {
+                engine.put(key(i), "value_" + i);
+            }
+            // Compaction is asynchronous; measuring mid-merge would report the
+            // shape of a store nobody actually queries.
+            Thread.sleep(3_000);
+
+            sample("hit", i -> engine.get(key(i % READ_KEYS)));
+            sample("miss (in key range)", i -> {
+                Optional<String> found = engine.get(absentKey(i));
+                if (found.isPresent()) {
+                    throw new IllegalStateException("that key should not exist");
+                }
+            });
+        } finally {
+            engine.close();
+        }
+        delete(DIR);
+    }
+
+    /**
+     * What the bloom filter is worth, measured rather than asserted.
+     *
+     * <p>The baseline is the same data under a filter deliberately sized for
+     * one key. Guava saturates it, so nearly every lookup says "maybe" and
+     * falls through to a block read, which is what a table with no filter at
+     * all would do. Both tables are otherwise identical.
+     */
+    private static void bloomComparison() throws Exception {
+        Path dir = DIR.resolve("bloom");
+        Files.createDirectories(dir);
+
+        TreeMap<String, Entry> entries = new TreeMap<>();
+        for (int i = 0; i < READ_KEYS; i++) {
+            entries.put(key(i), Entry.put("value_" + i));
+        }
+
+        Path sized = dir.resolve("sized.sst");
+        try (SSTableWriter writer = SSTableWriter.create(sized, entries.size())) {
+            for (var entry : entries.entrySet()) {
+                writer.add(entry.getKey(), entry.getValue());
+            }
+            writer.finish();
+        }
+        Path saturated = dir.resolve("saturated.sst");
+        try (SSTableWriter writer = SSTableWriter.create(saturated, 1)) {
+            for (var entry : entries.entrySet()) {
+                writer.add(entry.getKey(), entry.getValue());
+            }
+            writer.finish();
+        }
+
+        System.out.printf("%n%,d keys, misses against one table%n%n", READ_KEYS);
+        System.out.printf("%-28s %12s   %10s   %10s%n",
+                "filter", "reads/sec", "p50", "p99");
+        System.out.println("-".repeat(68));
+
+        try (SSTableReader with = new SSTableReader(sized);
+             SSTableReader without = new SSTableReader(saturated)) {
+            double withRate = sample("sized for the table", i -> {
+                try {
+                    with.get(absentKey(i));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            double withoutRate = sample("saturated (no help)", i -> {
+                try {
+                    without.get(absentKey(i));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            System.out.printf("%nbloom filter is worth %.1fx on lookups that miss%n",
+                    withRate / withoutRate);
+        }
+        delete(dir);
+    }
+
+    /** Times an operation, printing throughput and percentiles, returning ops/sec. */
+    private static double sample(String label, IntConsumer operation) {
+        for (int i = 0; i < READ_OPS / 10; i++) {
+            operation.accept(i);
+        }
+        long[] nanos = new long[READ_OPS];
+        for (int i = 0; i < READ_OPS; i++) {
+            long start = System.nanoTime();
+            operation.accept(i);
+            nanos[i] = System.nanoTime() - start;
+        }
+
+        long total = Arrays.stream(nanos).sum();
+        Arrays.sort(nanos);
+        double rate = READ_OPS / (total / 1e9);
+        System.out.printf("%-28s %,12.0f   %8.2fus   %8.2fus%n", label, rate,
+                nanos[READ_OPS / 2] / 1e3, nanos[(int) (READ_OPS * 0.99)] / 1e3);
+        return rate;
+    }
+
+    private static String key(int i) {
+        return String.format("key_%07d", i);
+    }
+
+    /**
+     * A key that is absent but sorts between two stored keys.
+     *
+     * <p>This matters more than it looks. A key outside the table's range is
+     * rejected by the min/max check before the filter is consulted, so
+     * measuring with one reports nothing about the filter at all.
+     */
+    private static String absentKey(int i) {
+        return key(i % READ_KEYS) + "x";
     }
 
     private static void run(DurabilityMode mode, int writers) throws Exception {

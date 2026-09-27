@@ -98,10 +98,9 @@ watch; the engine's real default is four megabytes.
 | Block checksums (CRC32C) | Done |
 | Block cache | Done |
 | Concurrent readers and writers | Done |
-| Write throughput benchmark | Done |
-| Bloom filters | Planned |
-| Compaction | Planned |
-| Read latency benchmark | Planned |
+| Leveled compaction | Done |
+| Bloom filters | Done |
+| Write and read benchmarks | Done |
 
 ## Write Throughput
 
@@ -133,6 +132,43 @@ which is to say concurrency bought nothing at all.
 to hide behind, the single write lock becomes the bottleneck and threads
 simply contend for it. Sharding the log would be the fix; it is not built.
 
+## Read Latency
+
+Same command, reported after the write table. 100,000 keys, read once
+compaction has settled:
+
+| Lookup | reads/sec | p50 | p99 |
+| --- | ---: | ---: | ---: |
+| Hit | 1,862,000 | 0.46us | 2.13us |
+| Miss, key inside the stored range | 2,243,000 | 0.33us | 1.58us |
+
+**These are memory-speed reads, and the number is only honest with that said.**
+100,000 small keys is about 2MB against a 16MB block cache, so the working set
+is resident and almost nothing reaches the disk. A dataset larger than the
+cache would look very different.
+
+### What the bloom filter is worth
+
+Measured against the same data written twice: once with a filter sized for the
+table, once with a filter deliberately sized for a single key, which Guava
+saturates so that nearly every lookup says "maybe" and falls through to a block
+read. That second table stands in for having no filter at all.
+
+| Filter | reads/sec on misses |
+| --- | ---: |
+| Sized for the table | 2,072,000 |
+| Saturated, no help | 843,000 |
+
+**2.5x on lookups that miss.** Slightly under the 3x this was aiming for, and
+the reason is worth knowing: a table already rejects any key outside its
+min/max range without reading anything, and leveled compaction already bounds a
+lookup to roughly one table per level. Both of those recover some of what a
+bloom filter would otherwise be the only thing catching.
+
+A miss whose key falls outside the stored range never consults the filter at
+all, so benchmarking with out-of-range keys measures nothing. The harness uses
+keys that sort between real ones.
+
 ## Design Notes
 
 **Tables are immutable.** That one property does most of the work: a block's
@@ -155,9 +191,10 @@ key's bytes are still in the file afterwards.
 
 ## Roadmap
 
-- **Leveled compaction** — size-tiered first, leveled after
-- **Bloom filters** — skip tables that cannot hold the key
 - **Sharded write path** — a single lock currently caps buffered throughput
+- **Idle compaction** — deletes are only reclaimed under write pressure, so an
+  idle store keeps tombstones sitting in a level 0 that never hit its trigger
+- **Cold read benchmark** — current read figures have the whole dataset cached
 
 ## Tech Stack
 
