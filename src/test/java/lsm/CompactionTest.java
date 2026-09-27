@@ -185,6 +185,14 @@ class CompactionTest {
             for (int i = 0; i < 2_900; i++) {
                 engine.delete(String.format("key_%05d", i));
             }
+
+            // Compaction is driven by pressure, so a store that goes idle keeps
+            // whatever tombstones are sitting in a level 0 that never reached
+            // its trigger. These writes supply that pressure, which is what a
+            // real store has anyway.
+            for (int i = 0; i < 400; i++) {
+                engine.put(String.format("zzz_%05d", i), "tail");
+            }
             eventually("bytes on disk should fall once tombstones are dropped",
                     () -> totalTableBytes() < before / 2);
 

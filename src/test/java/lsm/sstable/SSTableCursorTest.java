@@ -43,7 +43,9 @@ class SSTableCursorTest {
         SSTableWriter.write(viaMap, map);
 
         Path viaStream = dir.resolve("stream.sst");
-        try (SSTableWriter writer = SSTableWriter.create(viaStream)) {
+        // Same key estimate, or the two bloom filters differ in size and
+        // the files legitimately differ in bytes.
+        try (SSTableWriter writer = SSTableWriter.create(viaStream, map.size())) {
             for (var entry : map.entrySet()) {
                 writer.add(entry.getKey(), entry.getValue());
             }

@@ -110,6 +110,10 @@ public final class Compactor {
             cursors.add(table.cursor());
         }
 
+        // Inputs can hold the same key, so this overestimates. A filter sized
+        // too large costs a few bytes; one sized too small costs lookups.
+        long expectedKeys = job.inputs().stream().mapToLong(SSTableReader::entryCount).sum();
+
         List<Path> written = new ArrayList<>();
         SSTableWriter writer = null;
         long writtenBytes = 0;
@@ -124,7 +128,7 @@ public final class Compactor {
                 if (writer == null) {
                     Path path = dataDir.resolve(String.format(
                             "L%d_%06d.sst", job.outputLevel(), nextSequence.getAsLong()));
-                    writer = SSTableWriter.create(path);
+                    writer = SSTableWriter.create(path, expectedKeys);
                     written.add(path);
                     writtenBytes = 0;
                 }

@@ -1,5 +1,7 @@
 package lsm.sstable;
 
+import com.google.common.hash.BloomFilter;
+import com.google.common.hash.Funnels;
 import lsm.memtable.Entry;
 
 import java.io.BufferedOutputStream;
@@ -28,9 +30,14 @@ import java.util.zip.CRC32C;
  * [block]*       records packed to ~BLOCK_SIZE, then [crc32c:4] over them
  *                record: [keyLen:4][key][tombstone:1][valLen:4][val]
  * [index block]  one entry per block: [keyLen:4][firstKey][offset:8][length:4]
- * [metadata]     [maxKeyLen:4][maxKey]
+ * [metadata]     [entryCount:8][maxKeyLen:4][maxKey][bloomLen:4][bloom]
  * [footer]       [indexOffset:8][blockCount:4][metaOffset:8][formatVersion:4][magic:8]
  * </pre>
+ *
+ * The bloom filter answers "is this key definitely absent?" without touching a
+ * data block. A lookup that misses costs a few bytes of in-memory hashing
+ * rather than a block read and a checksum, which is what makes a store with
+ * many tables cheap to search.
  *
  * The largest key is recorded explicitly because compaction needs each table's
  * range to decide what overlaps what. The smallest key is already the first
@@ -57,7 +64,7 @@ public final class SSTableWriter implements Closeable {
     /** "LSMSST" plus a two byte tag; trailing bytes of every well-formed file. */
     public static final long MAGIC = 0x4C534D5353543031L;
 
-    public static final int FORMAT_VERSION = 3;
+    public static final int FORMAT_VERSION = 4;
     public static final int FOOTER_SIZE = 32;
     public static final int CHECKSUM_SIZE = 4;
 
@@ -66,6 +73,13 @@ public final class SSTableWriter implements Closeable {
 
     private static final int BUFFER_SIZE = 64 * 1024;
     private static final byte[] NO_BYTES = new byte[0];
+
+    /**
+     * One in a hundred lookups that should miss will read a block anyway.
+     * Tightening it costs bits per key for a shrinking return; this is the
+     * usual operating point and is what LevelDB's ten-bits-per-key works out to.
+     */
+    private static final double FALSE_POSITIVE_RATE = 0.01;
 
     private final Path path;
     private final Path tmp;
@@ -76,22 +90,38 @@ public final class SSTableWriter implements Closeable {
     private final ByteArrayOutputStream block = new ByteArrayOutputStream(BLOCK_SIZE * 2);
     private final DataOutputStream blockOut = new DataOutputStream(block);
 
+    private final BloomFilter<CharSequence> bloom;
+
     private String firstKey;
     private String lastKey;
     private long offset;
+    private long entryCount;
     private boolean finished;
 
-    /** Opens a writer for a table that does not exist yet. */
+    /** Opens a writer, sizing the bloom filter for a guess of 1000 keys. */
     public static SSTableWriter create(Path path) throws IOException {
+        return create(path, 1_000);
+    }
+
+    /**
+     * Opens a writer for a table that does not exist yet.
+     *
+     * <p>{@code expectedKeys} sizes the bloom filter. Guava needs the count up
+     * front and a stream has not got one, so callers pass what they know: a
+     * flush knows its MemTable exactly, a compaction adds up its inputs. An
+     * estimate that comes in low still yields a correct filter, just a chattier
+     * one, so being wrong here costs speed and never correctness.
+     */
+    public static SSTableWriter create(Path path, long expectedKeys) throws IOException {
         if (Files.exists(path)) {
             throw new IOException("Refusing to overwrite existing SSTable: " + path);
         }
-        return new SSTableWriter(path);
+        return new SSTableWriter(path, Math.max(expectedKeys, 1));
     }
 
     /** Writes an entire sorted map as one table. */
     public static void write(Path path, Map<String, Entry> sortedEntries) throws IOException {
-        try (SSTableWriter writer = create(path)) {
+        try (SSTableWriter writer = create(path, sortedEntries.size())) {
             for (Map.Entry<String, Entry> entry : sortedEntries.entrySet()) {
                 writer.add(entry.getKey(), entry.getValue());
             }
@@ -99,8 +129,10 @@ public final class SSTableWriter implements Closeable {
         }
     }
 
-    private SSTableWriter(Path path) throws IOException {
+    private SSTableWriter(Path path, long expectedKeys) throws IOException {
         this.path = path;
+        this.bloom = BloomFilter.create(
+                Funnels.stringFunnel(StandardCharsets.UTF_8), expectedKeys, FALSE_POSITIVE_RATE);
         this.tmp = path.resolveSibling(path.getFileName() + ".tmp");
         this.channel = FileChannel.open(tmp, StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
@@ -123,6 +155,8 @@ public final class SSTableWriter implements Closeable {
         if (firstKey == null) {
             firstKey = key;
         }
+        bloom.put(key);
+        entryCount++;
 
         byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
         byte[] valBytes = value.isTombstone()
@@ -164,8 +198,14 @@ public final class SSTableWriter implements Closeable {
         byte[] maxKey = lastKey == null
                 ? NO_BYTES
                 : lastKey.getBytes(StandardCharsets.UTF_8);
+        ByteArrayOutputStream bloomBytes = new ByteArrayOutputStream();
+        bloom.writeTo(bloomBytes);
+
+        tail.writeLong(entryCount);
         tail.writeInt(maxKey.length);
         tail.write(maxKey);
+        tail.writeInt(bloomBytes.size());
+        bloomBytes.writeTo(tail);
 
         tail.writeLong(indexOffset);
         tail.writeInt(index.size());

@@ -1,7 +1,10 @@
 package lsm.sstable;
 
+import com.google.common.hash.BloomFilter;
+import com.google.common.hash.Funnels;
 import lsm.memtable.Entry;
 
+import java.io.ByteArrayInputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -39,6 +42,14 @@ public final class SSTableReader implements AutoCloseable {
     private final long sequence;
     private final String minKey;
     private final String maxKey;
+    private final long entryCount;
+
+    /**
+     * Says a key is definitely absent, or probably present. The negative answer
+     * is the valuable one: it skips a block read entirely, which is most of the
+     * cost of a lookup that was never going to find anything.
+     */
+    private final BloomFilter<CharSequence> bloom;
 
     /**
      * Readers currently using this table, plus one held by the engine while the
@@ -95,19 +106,29 @@ public final class SSTableReader implements AutoCloseable {
             this.level = parseLevel(path);
             this.sequence = parseSequence(path);
             this.minKey = blockCount == 0 ? null : firstKeys[0];
-            this.maxKey = readMaxKey(metaOffset, (int) (metaEnd - metaOffset));
+
+            ByteBuffer meta = read(metaOffset, (int) (metaEnd - metaOffset));
+            this.entryCount = readEntryCount(meta);
+            this.maxKey = readMaxKey(meta);
+            this.bloom = readBloom(meta);
         } catch (IOException e) {
             channel.close();
             throw e;
         }
     }
 
-    /** Reads the stored largest key, or null for an empty table. */
-    private String readMaxKey(long from, int length) throws IOException {
-        if (length < 4) {
+    private long readEntryCount(ByteBuffer meta) throws IOException {
+        if (meta.remaining() < 8) {
             throw new IOException("Corrupt SSTable metadata: " + path);
         }
-        ByteBuffer meta = read(from, length);
+        return meta.getLong();
+    }
+
+    /** Reads the stored largest key, or null for an empty table. */
+    private String readMaxKey(ByteBuffer meta) throws IOException {
+        if (meta.remaining() < 4) {
+            throw new IOException("Corrupt SSTable metadata: " + path);
+        }
         int keyLen = meta.getInt();
         if (keyLen < 0 || keyLen > meta.remaining()) {
             throw new IOException("Corrupt SSTable metadata: " + path);
@@ -118,6 +139,20 @@ public final class SSTableReader implements AutoCloseable {
         byte[] keyBytes = new byte[keyLen];
         meta.get(keyBytes);
         return new String(keyBytes, StandardCharsets.UTF_8);
+    }
+
+    private BloomFilter<CharSequence> readBloom(ByteBuffer meta) throws IOException {
+        if (meta.remaining() < 4) {
+            throw new IOException("Corrupt SSTable metadata: " + path);
+        }
+        int length = meta.getInt();
+        if (length < 0 || length > meta.remaining()) {
+            throw new IOException("Corrupt SSTable metadata: " + path);
+        }
+        byte[] bytes = new byte[length];
+        meta.get(bytes);
+        return BloomFilter.readFrom(new ByteArrayInputStream(bytes),
+                Funnels.stringFunnel(StandardCharsets.UTF_8));
     }
 
     /** Level from an {@code L<level>_<sequence>.sst} name, or 0 for other names. */
@@ -158,6 +193,9 @@ public final class SSTableReader implements AutoCloseable {
      * @throws IOException if the block holding the key fails its checksum
      */
     public Entry get(String key) throws IOException {
+        if (!bloom.mightContain(key)) {
+            return null;
+        }
         int slot = indexSlot(key);
         if (slot < 0) {
             return null;
@@ -219,6 +257,16 @@ public final class SSTableReader implements AutoCloseable {
 
     public long sizeBytes() throws IOException {
         return channel.size();
+    }
+
+    /** Entries stored, tombstones included. Sizes a compaction's bloom filter. */
+    public long entryCount() {
+        return entryCount;
+    }
+
+    /** False when the key is definitely absent; true means it may be present. */
+    public boolean mightContain(String key) {
+        return bloom.mightContain(key);
     }
 
     /** Whether this table's key range intersects [lo, hi], both inclusive. */
