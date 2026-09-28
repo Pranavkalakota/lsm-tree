@@ -335,7 +335,24 @@ public final class SSTableReader implements AutoCloseable {
      * whether an older table below still needs shadowing.
      */
     public Cursor cursor() throws IOException {
-        return new Cursor();
+        return new Cursor(0);
+    }
+
+    /**
+     * A cursor positioned at the first key at or after {@code fromKey}.
+     *
+     * <p>Starts from the block that could hold the key rather than from the
+     * beginning of the table, so a scan over a narrow range costs one block
+     * instead of the whole file.
+     */
+    public Cursor cursorFrom(String fromKey) throws IOException {
+        int slot = indexSlot(fromKey);
+        // A key before every block means the scan starts at the first one.
+        Cursor cursor = new Cursor(Math.max(slot, 0));
+        while (cursor.hasNext() && cursor.current().key().compareTo(fromKey) < 0) {
+            cursor.next();
+        }
+        return cursor;
     }
 
     /** One entry of a table: the key, and the value or tombstone stored for it. */
@@ -345,11 +362,12 @@ public final class SSTableReader implements AutoCloseable {
     /** Forward-only walk over a table's entries. Not thread safe; make one per scan. */
     public final class Cursor {
 
-        private int block = -1;
+        private int block;
         private ByteBuffer records = ByteBuffer.allocate(0);
         private Row current;
 
-        private Cursor() throws IOException {
+        private Cursor(int startBlock) throws IOException {
+            this.block = startBlock - 1;
             advance();
         }
 
