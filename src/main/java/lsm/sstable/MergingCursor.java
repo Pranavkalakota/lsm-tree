@@ -22,16 +22,16 @@ import java.util.PriorityQueue;
  */
 public final class MergingCursor implements Closeable {
 
-    private final List<SSTableReader.Cursor> sources;
+    private final List<RowSource> sources;
     private final PriorityQueue<Head> heap;
 
-    /** @param sources cursors over the inputs, newest first */
-    public MergingCursor(List<SSTableReader.Cursor> sources) {
+    /** @param sources the inputs, newest first */
+    public MergingCursor(List<? extends RowSource> sources) {
         this.sources = new ArrayList<>(sources);
         this.heap = new PriorityQueue<>(
                 Comparator.comparing(Head::key).thenComparingInt(Head::source));
         for (int i = 0; i < this.sources.size(); i++) {
-            SSTableReader.Cursor cursor = this.sources.get(i);
+            RowSource cursor = this.sources.get(i);
             if (cursor.hasNext()) {
                 heap.add(new Head(i, cursor.current().key()));
             }
@@ -63,7 +63,7 @@ public final class MergingCursor implements Closeable {
 
     /** Steps one source forward and re-queues it if it has more to give. */
     private SSTableReader.Row advance(int source) throws IOException {
-        SSTableReader.Cursor cursor = sources.get(source);
+        RowSource cursor = sources.get(source);
         SSTableReader.Row row = cursor.next();
         if (cursor.hasNext()) {
             heap.add(new Head(source, cursor.current().key()));

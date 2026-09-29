@@ -360,7 +360,7 @@ public final class SSTableReader implements AutoCloseable {
     }
 
     /** Forward-only walk over a table's entries. Not thread safe; make one per scan. */
-    public final class Cursor {
+    public final class Cursor implements RowSource {
 
         private int block;
         private ByteBuffer records = ByteBuffer.allocate(0);
@@ -372,15 +372,18 @@ public final class SSTableReader implements AutoCloseable {
         }
 
         /** The entry the cursor sits on, or null once the table is exhausted. */
+        @Override
         public Row current() {
             return current;
         }
 
+        @Override
         public boolean hasNext() {
             return current != null;
         }
 
         /** Moves to the next entry, returning the one just passed. */
+        @Override
         public Row next() throws IOException {
             Row row = current;
             advance();
