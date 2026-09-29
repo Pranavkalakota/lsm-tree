@@ -4,6 +4,8 @@ import lsm.compaction.Compactor;
 import lsm.memtable.Entry;
 import lsm.memtable.MemTable;
 import lsm.sstable.BlockCache;
+import lsm.sstable.MergingCursor;
+import lsm.sstable.RowSource;
 import lsm.sstable.SSTableReader;
 import lsm.sstable.SSTableWriter;
 import lsm.wal.DurabilityMode;
@@ -18,8 +20,13 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.Spliterator;
+import java.util.Spliterators;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -28,6 +35,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 public class LSMStoreEngine implements StorageEngine {
 
@@ -175,6 +183,110 @@ public class LSMStoreEngine implements StorageEngine {
         return min != null
                 && key.compareTo(min) >= 0
                 && key.compareTo(table.maxKey()) <= 0;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>The MemTable range is copied before the table list is snapshotted,
+     * and the order matters. A flush publishes its new table before clearing
+     * the MemTable, so reading the MemTable first means a key is either still
+     * in the copy or already in a table this scan will see. Snapshotting the
+     * other way round leaves a window where a flush lands in between and the
+     * scan sees the key in neither.
+     *
+     * <p>The copy is bounded by the MemTable's own size limit, and taking it
+     * avoids holding the write lock for the life of the scan.
+     */
+    @Override
+    public Stream<Row> scan(String fromInclusive, String toExclusive) {
+        checkNotClosed();
+        if (fromInclusive != null && toExclusive != null
+                && fromInclusive.compareTo(toExclusive) > 0) {
+            return Stream.empty();
+        }
+
+        List<Map.Entry<String, Entry>> buffered =
+                new ArrayList<>(memTable.range(fromInclusive, toExclusive).entrySet());
+
+        List<SSTableReader> held = new ArrayList<>();
+        List<RowSource> sources = new ArrayList<>();
+        sources.add(RowSource.of(buffered.iterator()));
+
+        try {
+            for (SSTableReader table : tables.get()) {
+                if (!mightOverlap(table, fromInclusive, toExclusive) || !table.acquire()) {
+                    continue;
+                }
+                held.add(table);
+                sources.add(fromInclusive == null
+                        ? table.cursor()
+                        : table.cursorFrom(fromInclusive));
+            }
+        } catch (IOException e) {
+            held.forEach(SSTableReader::release);
+            throw new UncheckedIOException("Scan failed to start", e);
+        }
+
+        MergingCursor merged = new MergingCursor(sources);
+        return StreamSupport.stream(Spliterators.spliteratorUnknownSize(
+                        rows(merged, toExclusive), Spliterator.ORDERED | Spliterator.SORTED), false)
+                // Each table stays alive until the scan finishes with it, even
+                // if compaction retires it in the meantime.
+                .onClose(() -> {
+                    merged.close();
+                    held.forEach(SSTableReader::release);
+                });
+    }
+
+    /** Drops tombstones and stops at the upper bound; keys ascend, so it can stop early. */
+    private Iterator<Row> rows(MergingCursor merged, String toExclusive) {
+        return new Iterator<>() {
+            private Row pending = advance();
+
+            private Row advance() {
+                try {
+                    while (merged.hasNext()) {
+                        SSTableReader.Row row = merged.next();
+                        if (toExclusive != null && row.key().compareTo(toExclusive) >= 0) {
+                            return null;
+                        }
+                        if (!row.value().isTombstone()) {
+                            return new Row(row.key(), row.value().value().orElseThrow());
+                        }
+                    }
+                    return null;
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Scan failed", e);
+                }
+            }
+
+            @Override
+            public boolean hasNext() {
+                return pending != null;
+            }
+
+            @Override
+            public Row next() {
+                if (pending == null) {
+                    throw new NoSuchElementException();
+                }
+                Row row = pending;
+                pending = advance();
+                return row;
+            }
+        };
+    }
+
+    /** Whether a table's key range could intersect the requested one. */
+    private static boolean mightOverlap(SSTableReader table, String from, String to) {
+        if (table.minKey() == null) {
+            return false;
+        }
+        if (from != null && table.maxKey().compareTo(from) < 0) {
+            return false;
+        }
+        return to == null || table.minKey().compareTo(to) < 0;
     }
 
     @Override

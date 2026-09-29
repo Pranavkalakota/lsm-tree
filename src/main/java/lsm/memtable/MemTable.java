@@ -58,6 +58,26 @@ public class MemTable {
         return data.isEmpty();
     }
 
+    /**
+     * A view of the entries in a key range, ascending. Null bounds are open.
+     *
+     * <p>The map underneath is live, so this reflects writes that land after
+     * the call. Callers wanting a stable range must copy it.
+     */
+    public Map<String, Entry> range(String fromInclusive, String toExclusive) {
+        if (fromInclusive == null && toExclusive == null) {
+            return Collections.unmodifiableMap(data);
+        }
+        if (fromInclusive == null) {
+            return Collections.unmodifiableMap(data.headMap(toExclusive, false));
+        }
+        if (toExclusive == null) {
+            return Collections.unmodifiableMap(data.tailMap(fromInclusive, true));
+        }
+        return Collections.unmodifiableMap(
+                data.subMap(fromInclusive, true, toExclusive, false));
+    }
+
     public Map<String, Entry> entries() {
         return Collections.unmodifiableMap(data);
     }
