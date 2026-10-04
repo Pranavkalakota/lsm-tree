@@ -109,14 +109,14 @@ mvn -q compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
 java -cp "target/classes:$(cat target/cp.txt)" lsm.Benchmark
 ```
 
-Measured on an M-series laptop SSD:
+Measured on an M-series laptop SSD (12 cores):
 
 | Mode | Writers | writes/sec | Survives |
 | --- | ---: | ---: | --- |
-| BUFFERED | 1 | 455,000 | process crash |
-| BUFFERED | 8 | 349,000 | process crash |
+| BUFFERED | 1 | 481,000 | process crash |
+| BUFFERED | 8 | 370,000 | process crash |
 | SYNC | 1 | 263 | power loss |
-| SYNC | 8 | 854 | power loss |
+| SYNC | 8 | 829 | power loss |
 
 `BUFFERED` is the default and returns once the bytes reach the operating
 system. `SYNC` waits for the disk on every write, which costs ~3.8ms and is
@@ -128,9 +128,15 @@ appended before it, so writers arriving during a commit ride along with it.
 Before that existed, eight writers measured 262/sec against one writer's 266,
 which is to say concurrency bought nothing at all.
 
-**BUFFERED gets slower with more writers,** 349K against 455K. With no fsync
-to hide behind, the single write lock becomes the bottleneck and threads
-simply contend for it. Sharding the log would be the fix; it is not built.
+**The write path is sharded, but only for buffered writes.** Keys hash to one
+of eight stripes, each with its own log, MemTable and lock, so writers mostly
+stay out of each other's way. Measured at 454K to 648K writes/sec at two
+writers and 378K to 637K at four.
+
+Sync mode deliberately keeps a single log. Splitting it splits exactly what
+group commit batches, and sharding measured 872 down to 446 writes/sec at eight
+writers. The two modes have different bottlenecks, so they get opposite
+treatment: contention is the limit for buffered, the disk is the limit for sync.
 
 ## Read Latency
 
@@ -139,8 +145,8 @@ compaction has settled:
 
 | Lookup | reads/sec | p50 | p99 |
 | --- | ---: | ---: | ---: |
-| Hit | 1,862,000 | 0.46us | 2.13us |
-| Miss, key inside the stored range | 2,243,000 | 0.33us | 1.58us |
+| Hit | 5,150,000 | 0.17us | 0.46us |
+| Miss, key inside the stored range | 6,097,000 | 0.17us | 0.38us |
 
 **These are memory-speed reads, and the number is only honest with that said.**
 100,000 small keys is about 2MB against a 16MB block cache, so the working set
@@ -156,14 +162,18 @@ read. That second table stands in for having no filter at all.
 
 | Filter | reads/sec on misses |
 | --- | ---: |
-| Sized for the table | 2,072,000 |
-| Saturated, no help | 843,000 |
+| Sized for the table | 3,651,000 |
+| Saturated, no help | 942,000 |
 
-**2.5x on lookups that miss.** Slightly under the 3x this was aiming for, and
-the reason is worth knowing: a table already rejects any key outside its
-min/max range without reading anything, and leveled compaction already bounds a
-lookup to roughly one table per level. Both of those recover some of what a
-bloom filter would otherwise be the only thing catching.
+**3.9x on lookups that miss.** Note that a table already rejects any key outside
+its min/max range without reading anything, and leveled compaction already
+bounds a lookup to roughly one table per level, so the filter is only earning
+the part neither of those catches.
+
+A note on how these were measured: an earlier version of this harness built its
+keys inside the timed loop, and `String.format` is not free at these rates. It
+understated reads by roughly 3x and hid the effect of write sharding entirely.
+Keys are now built before the clock starts.
 
 A miss whose key falls outside the stored range never consults the filter at
 all, so benchmarking with out-of-range keys measures nothing. The harness uses

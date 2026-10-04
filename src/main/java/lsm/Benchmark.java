@@ -53,11 +53,15 @@ public final class Benchmark {
     private static final int READ_KEYS = Integer.getInteger("bench.read.keys", 100_000);
     private static final int READ_OPS = Integer.getInteger("bench.read.ops", 100_000);
 
+    /** Negative means let the engine pick, which depends on durability mode. */
+    private static final int SHARDS = Integer.getInteger("bench.shards", -1);
+
     private static final Path DIR = Path.of(System.getProperty(
             "bench.dir", System.getProperty("java.io.tmpdir") + "/lsm-benchmark"));
 
     public static void main(String[] args) throws Exception {
-        System.out.printf("%,d byte memtable, store at %s%n%n", MEMTABLE, DIR);
+        System.out.printf("%,d byte memtable, shards=%s, store at %s%n%n",
+                MEMTABLE, SHARDS > 0 ? String.valueOf(SHARDS) : "per mode", DIR);
         System.out.printf("%-12s %8s %9s   %12s   %10s   %s%n",
                 "mode", "writers", "writes", "writes/sec", "ms/write", "survives");
         System.out.println("-".repeat(80));
@@ -100,9 +104,16 @@ public final class Benchmark {
             // shape of a store nobody actually queries.
             Thread.sleep(3_000);
 
-            sample("hit", i -> engine.get(key(i % READ_KEYS)));
+            String[] present = new String[READ_OPS];
+            String[] absent = new String[READ_OPS];
+            for (int i = 0; i < READ_OPS; i++) {
+                present[i] = key(i % READ_KEYS);
+                absent[i] = absentKey(i);
+            }
+
+            sample("hit", i -> engine.get(present[i]));
             sample("miss (in key range)", i -> {
-                Optional<String> found = engine.get(absentKey(i));
+                Optional<String> found = engine.get(absent[i]);
                 if (found.isPresent()) {
                     throw new IllegalStateException("that key should not exist");
                 }
@@ -150,18 +161,23 @@ public final class Benchmark {
                 "filter", "reads/sec", "p50", "p99");
         System.out.println("-".repeat(68));
 
+        String[] absent = new String[READ_OPS];
+        for (int i = 0; i < READ_OPS; i++) {
+            absent[i] = absentKey(i);
+        }
+
         try (SSTableReader with = new SSTableReader(sized);
              SSTableReader without = new SSTableReader(saturated)) {
             double withRate = sample("sized for the table", i -> {
                 try {
-                    with.get(absentKey(i));
+                    with.get(absent[i]);
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }
             });
             double withoutRate = sample("saturated (no help)", i -> {
                 try {
-                    without.get(absentKey(i));
+                    without.get(absent[i]);
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }
@@ -210,7 +226,9 @@ public final class Benchmark {
     private static void run(DurabilityMode mode, int writers) throws Exception {
         int writes = mode == DurabilityMode.SYNC ? SYNC_WRITES : WRITES;
         delete(DIR);
-        LSMStoreEngine engine = new LSMStoreEngine(DIR, MEMTABLE, mode);
+        LSMStoreEngine engine = SHARDS > 0
+                ? new LSMStoreEngine(DIR, MEMTABLE, mode, SHARDS)
+                : new LSMStoreEngine(DIR, MEMTABLE, mode);
         try {
             drive(engine, writers, Math.max(writes / 10, 1), "warm");
             long nanos = drive(engine, writers, writes, "run");
@@ -223,21 +241,47 @@ public final class Benchmark {
         }
     }
 
+    /**
+     * Runs {@code total} writes and returns how long they took.
+     *
+     * <p>Keys and values are built before the clock starts. Formatting them
+     * inside the timed loop is not free at these rates: doing so understated
+     * single-writer throughput by around 20% and hid the effect of sharding
+     * entirely, which is how an earlier version of this harness concluded that
+     * splitting the write path achieved nothing.
+     */
     private static long drive(LSMStoreEngine engine, int writers, int total, String tag)
             throws Exception {
         if (writers == 1) {
+            String[] keys = new String[total];
+            String[] values = new String[total];
+            for (int i = 0; i < total; i++) {
+                keys[i] = tag + "_key_" + i;
+                values[i] = "value_" + i;
+            }
             long start = System.nanoTime();
             for (int i = 0; i < total; i++) {
-                engine.put(tag + "_key_" + i, "value_" + i);
+                engine.put(keys[i], values[i]);
             }
             return System.nanoTime() - start;
+        }
+
+        int per = total / writers;
+        String[][] keys = new String[writers][per];
+        String[] values = new String[per];
+        for (int t = 0; t < writers; t++) {
+            for (int i = 0; i < per; i++) {
+                keys[t][i] = tag + "_t" + t + "_k" + i;
+            }
+        }
+        for (int i = 0; i < per; i++) {
+            values[i] = "value_" + i;
         }
 
         ExecutorService pool = Executors.newFixedThreadPool(writers);
         AtomicInteger next = new AtomicInteger();
         CountDownLatch ready = new CountDownLatch(writers);
         CountDownLatch gate = new CountDownLatch(1);
-        int per = total / writers;
 
         try {
             List<Future<?>> futures = new ArrayList<>();
@@ -247,7 +291,7 @@ public final class Benchmark {
                     ready.countDown();
                     gate.await();
                     for (int i = 0; i < per; i++) {
-                        engine.put(tag + "_t" + id + "_k" + i, "value_" + i);
+                        engine.put(keys[id][i], values[i]);
                     }
                     return null;
                 }));
