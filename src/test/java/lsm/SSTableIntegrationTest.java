@@ -29,6 +29,14 @@ class SSTableIntegrationTest {
 
     private static final long FLUSH_EVERY_WRITE = 1;
 
+    /** Every shard keeps its own log, so size questions are about the total. */
+    private long totalLogBytes() throws IOException {
+        try (Stream<Path> files = Files.list(dir)) {
+            return files.filter(p -> p.getFileName().toString().startsWith("wal_"))
+                    .mapToLong(p -> p.toFile().length()).sum();
+        }
+    }
+
     private long tableCount() throws IOException {
         try (Stream<Path> files = Files.list(dir)) {
             return files.filter(p -> p.toString().endsWith(".sst")).count();
@@ -69,8 +77,8 @@ class SSTableIntegrationTest {
         engine.put("key", "a-reasonably-long-value-to-make-the-log-grow");
         engine.close();
 
-        // The table now owns the data, so the log must not still be carrying it.
-        assertEquals(0, Files.size(dir.resolve("wal.log")));
+        // The table now owns the data, so no shard's log should still carry it.
+        assertEquals(0, totalLogBytes());
     }
 
     // --- precedence between the MemTable and tables ---

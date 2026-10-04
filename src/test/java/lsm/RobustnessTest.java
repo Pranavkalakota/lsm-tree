@@ -20,6 +20,14 @@ class RobustnessTest {
     @TempDir
     Path tempDir;
 
+    /** Each shard owns a log, so size questions are about their total. */
+    private long totalLogBytes() throws IOException {
+        try (var files = Files.list(tempDir)) {
+            return files.filter(p -> p.getFileName().toString().startsWith("wal_"))
+                    .mapToLong(p -> p.toFile().length()).sum();
+        }
+    }
+
     // --- Operations after close ---
 
     @Test
@@ -221,8 +229,14 @@ class RobustnessTest {
         engine.close();
 
         // Replay the WAL independently and verify it matches engine behavior
+        // The two keys may hash to different shards, so replay all the logs.
         MemTable replayed = new MemTable(1024 * 1024);
-        WriteAheadLog.replay(dataDir.resolve("wal.log"), replayed);
+        try (var logs = Files.list(dataDir)) {
+            for (Path log : logs.filter(p -> p.getFileName().toString().startsWith("wal_"))
+                    .sorted().toList()) {
+                WriteAheadLog.replay(log, replayed);
+            }
+        }
 
         assertTrue(replayed.get("key1").isTombstone());
         assertEquals("value2", replayed.get("key2").value().orElseThrow());
@@ -277,18 +291,18 @@ class RobustnessTest {
     // --- WAL doesn't grow without bound across restarts ---
 
     @Test
-    void walSizeDoesNotGrowAcrossRestarts() {
+    void walSizeDoesNotGrowAcrossRestarts() throws IOException {
         LSMStoreEngine engine1 = new LSMStoreEngine(tempDir);
         for (int i = 0; i < 100; i++) {
             engine1.put("key-" + i, "val-" + i);
         }
         engine1.close();
-        long walSizeAfterFirstRun = tempDir.resolve("wal.log").toFile().length();
+        long walSizeAfterFirstRun = totalLogBytes();
 
         // Reopen without writing anything new
         LSMStoreEngine engine2 = new LSMStoreEngine(tempDir);
         engine2.close();
-        long walSizeAfterReopen = tempDir.resolve("wal.log").toFile().length();
+        long walSizeAfterReopen = totalLogBytes();
 
         // WAL should be roughly the same size (re-serialized from MemTable),
         // not doubled from naive append-on-replay

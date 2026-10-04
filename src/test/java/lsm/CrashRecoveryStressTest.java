@@ -196,11 +196,18 @@ class CrashRecoveryStressTest {
     @Test
     void walWriteOnDiskBeforeGetSees() {
         LSMStoreEngine engine = new LSMStoreEngine(tempDir);
-        java.io.File walFile = tempDir.resolve("wal.log").toFile();
+        java.util.function.Supplier<Long> walBytes = () -> {
+            try (var files = java.nio.file.Files.list(tempDir)) {
+                return files.filter(p -> p.getFileName().toString().startsWith("wal_"))
+                        .mapToLong(p -> p.toFile().length()).sum();
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        };
 
-        long sizeBefore = walFile.length();
+        long sizeBefore = walBytes.get();
         engine.put("k1", "v1");
-        long sizeAfterPut = walFile.length();
+        long sizeAfterPut = walBytes.get();
         assertTrue(sizeAfterPut > sizeBefore,
                 "WAL must grow on disk after put");
 
