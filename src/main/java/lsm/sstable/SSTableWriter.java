@@ -27,7 +27,8 @@ import java.util.zip.CRC32C;
  * Serializes sorted entries into an immutable SSTable file.
  *
  * <pre>
- * [block]*       records packed to ~BLOCK_SIZE, then [crc32c:4] over them
+ * [block]*       [type:1][rawLen:4][payload][crc32c:4]
+ *                payload is the records, compressed unless that did not pay
  *                record: [keyLen:4][key][tombstone:1][valLen:4][val]
  * [index block]  one entry per block: [keyLen:4][firstKey][offset:8][length:4]
  * [metadata]     [entryCount:8][maxKeyLen:4][maxKey][bloomLen:4][bloom]
@@ -64,7 +65,10 @@ public final class SSTableWriter implements Closeable {
     /** "LSMSST" plus a two byte tag; trailing bytes of every well-formed file. */
     public static final long MAGIC = 0x4C534D5353543031L;
 
-    public static final int FORMAT_VERSION = 4;
+    public static final int FORMAT_VERSION = 5;
+
+    /** [type:1][rawLen:4] in front of every block's payload. */
+    public static final int BLOCK_HEADER_SIZE = 5;
     public static final int FOOTER_SIZE = 32;
     public static final int CHECKSUM_SIZE = 4;
 
@@ -81,6 +85,13 @@ public final class SSTableWriter implements Closeable {
      */
     private static final double FALSE_POSITIVE_RATE = 0.01;
 
+    /**
+     * Compression has to beat this to be worth keeping. Below it the block is
+     * stored raw, so incompressible data does not pay decompression on every
+     * read for a saving that rounds to nothing.
+     */
+    private static final double WORTHWHILE_RATIO = 0.9;
+
     private final Path path;
     private final Path tmp;
     private final FileChannel channel;
@@ -91,6 +102,7 @@ public final class SSTableWriter implements Closeable {
     private final DataOutputStream blockOut = new DataOutputStream(block);
 
     private final BloomFilter<CharSequence> bloom;
+    private final CompressionType compression;
 
     private String firstKey;
     private String lastKey;
@@ -103,6 +115,15 @@ public final class SSTableWriter implements Closeable {
         return create(path, 1_000);
     }
 
+    /** Opens a writer that stores blocks with the given compression. */
+    public static SSTableWriter create(Path path, long expectedKeys,
+            CompressionType compression) throws IOException {
+        if (Files.exists(path)) {
+            throw new IOException("Refusing to overwrite existing SSTable: " + path);
+        }
+        return new SSTableWriter(path, Math.max(expectedKeys, 1), compression);
+    }
+
     /**
      * Opens a writer for a table that does not exist yet.
      *
@@ -113,10 +134,7 @@ public final class SSTableWriter implements Closeable {
      * one, so being wrong here costs speed and never correctness.
      */
     public static SSTableWriter create(Path path, long expectedKeys) throws IOException {
-        if (Files.exists(path)) {
-            throw new IOException("Refusing to overwrite existing SSTable: " + path);
-        }
-        return new SSTableWriter(path, Math.max(expectedKeys, 1));
+        return create(path, expectedKeys, CompressionType.LZ4);
     }
 
     /** Writes an entire sorted map as one table. */
@@ -129,8 +147,10 @@ public final class SSTableWriter implements Closeable {
         }
     }
 
-    private SSTableWriter(Path path, long expectedKeys) throws IOException {
+    private SSTableWriter(Path path, long expectedKeys, CompressionType compression)
+            throws IOException {
         this.path = path;
+        this.compression = compression;
         this.bloom = BloomFilter.create(
                 Funnels.stringFunnel(StandardCharsets.UTF_8), expectedKeys, FALSE_POSITIVE_RATE);
         this.tmp = path.resolveSibling(path.getFileName() + ".tmp");
@@ -235,16 +255,32 @@ public final class SSTableWriter implements Closeable {
     }
 
     private void emitBlock() throws IOException {
-        byte[] bytes = block.toByteArray();
+        byte[] raw = block.toByteArray();
         block.reset();
 
-        CRC32C crc = new CRC32C();
-        crc.update(bytes);
+        byte[] payload = compression.compress(raw);
+        CompressionType stored = compression;
+        if (payload.length > raw.length * WORTHWHILE_RATIO) {
+            payload = raw;
+            stored = CompressionType.NONE;
+        }
 
-        out.write(bytes);
+        ByteBuffer header = ByteBuffer.allocate(BLOCK_HEADER_SIZE);
+        header.put(stored.id());
+        header.putInt(raw.length);
+
+        // Checksum covers the bytes exactly as they land on disk, so a corrupt
+        // block is rejected before anything tries to decompress it. Feeding
+        // damaged input to a decompressor is how a bad read becomes a crash.
+        CRC32C crc = new CRC32C();
+        crc.update(header.array());
+        crc.update(payload);
+
+        out.write(header.array());
+        out.write(payload);
         out.write(ByteBuffer.allocate(CHECKSUM_SIZE).putInt((int) crc.getValue()).array());
 
-        int length = bytes.length + CHECKSUM_SIZE;
+        int length = BLOCK_HEADER_SIZE + payload.length + CHECKSUM_SIZE;
         index.add(new BlockRef(firstKey, offset, length));
         offset += length;
         firstKey = null;

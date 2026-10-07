@@ -440,18 +440,28 @@ public final class SSTableReader implements AutoCloseable {
 
     private byte[] loadAndVerify(int slot, long offset) throws IOException {
         int length = blockLengths[slot];
+        if (length < SSTableWriter.BLOCK_HEADER_SIZE + SSTableWriter.CHECKSUM_SIZE) {
+            throw new IOException("Block " + slot + " is too short in " + path);
+        }
         ByteBuffer raw = read(offset, length);
-        int dataLength = length - SSTableWriter.CHECKSUM_SIZE;
+        int storedLength = length - SSTableWriter.CHECKSUM_SIZE;
 
+        // Verified before decompression, never after: a decompressor handed
+        // corrupt input can fail in far stranger ways than a bad checksum.
         CRC32C crc = new CRC32C();
-        crc.update(raw.array(), 0, dataLength);
-        if ((int) crc.getValue() != raw.getInt(dataLength)) {
+        crc.update(raw.array(), 0, storedLength);
+        if ((int) crc.getValue() != raw.getInt(storedLength)) {
             throw new IOException("Checksum mismatch in block " + slot + " of " + path
                     + "; the file has been corrupted");
         }
-        byte[] records = new byte[dataLength];
-        System.arraycopy(raw.array(), 0, records, 0, dataLength);
-        return records;
+
+        CompressionType compression = CompressionType.byId(raw.get(0));
+        int rawLength = raw.getInt(1);
+        if (rawLength < 0) {
+            throw new IOException("Corrupt block header in " + path);
+        }
+        return compression.decompress(raw.array(), SSTableWriter.BLOCK_HEADER_SIZE,
+                storedLength - SSTableWriter.BLOCK_HEADER_SIZE, rawLength);
     }
 
     private void loadIndex(long from, int length, int count, long dataEnd) throws IOException {

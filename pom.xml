@@ -34,6 +34,15 @@
             <version>3.1.8</version>
         </dependency>
 
+        <!-- Block compression. LZ4 trades a worse ratio than gzip for being
+             roughly an order of magnitude faster, which is the right side of
+             the trade when every block read pays the decompression cost. -->
+        <dependency>
+            <groupId>org.lz4</groupId>
+            <artifactId>lz4-java</artifactId>
+            <version>1.8.0</version>
+        </dependency>
+
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
