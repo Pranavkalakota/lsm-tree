@@ -1,6 +1,8 @@
 package lsm;
 
 import lsm.memtable.Entry;
+import lsm.sstable.BlockCache;
+import lsm.sstable.CompressionType;
 import lsm.sstable.SSTableReader;
 import lsm.sstable.SSTableWriter;
 import lsm.wal.DurabilityMode;
@@ -50,6 +52,9 @@ public final class Benchmark {
      */
     private static final long MEMTABLE = Long.getLong("bench.memtable", 64L * 1024 * 1024);
 
+    private static final int COMPRESSION_KEYS =
+            Integer.getInteger("bench.compression.keys", 50_000);
+
     private static final int READ_KEYS = Integer.getInteger("bench.read.keys", 100_000);
     private static final int READ_OPS = Integer.getInteger("bench.read.ops", 100_000);
 
@@ -73,6 +78,7 @@ public final class Benchmark {
 
         reads();
         bloomComparison();
+        compression();
 
         System.out.println("""
 
@@ -186,6 +192,112 @@ public final class Benchmark {
                     withRate / withoutRate);
         }
         delete(dir);
+    }
+
+    /**
+     * What compression costs and what it saves.
+     *
+     * <p>The saving depends entirely on the data, so several shapes are
+     * reported rather than one headline ratio. The cost is paid on reads that
+     * miss the block cache, since the cache holds blocks already decompressed,
+     * so the read comparison deliberately uses a cache far too small to help.
+     */
+    private static void compression() throws Exception {
+        Path dir = DIR.resolve("compression");
+        Files.createDirectories(dir);
+
+        System.out.printf("%n%,d keys per dataset%n%n", COMPRESSION_KEYS);
+        System.out.printf("%-26s %12s %12s %8s%n", "dataset", "raw", "lz4", "saving");
+        System.out.println("-".repeat(62));
+
+        long rawTotal = shape(dir, "repetitive", i ->
+                "status=active;tier=free;region=us-east-1");
+        shape(dir, "json-like", i ->
+                "{\"id\":" + i + ",\"type\":\"click\",\"ok\":true}");
+        shape(dir, "tiny", i -> "1");
+        shape(dir, "high entropy", Benchmark::noise);
+
+        readCost(dir);
+        delete(dir);
+        if (rawTotal < 0) {
+            throw new IllegalStateException("unreachable");
+        }
+    }
+
+    /** Writes one dataset both ways and reports the saving. */
+    private static long shape(Path dir, String label, java.util.function.IntFunction<String> value)
+            throws Exception {
+        TreeMap<String, Entry> entries = new TreeMap<>();
+        for (int i = 0; i < COMPRESSION_KEYS; i++) {
+            entries.put(String.format("key_%08d", i), Entry.put(value.apply(i)));
+        }
+        long raw = writeTable(dir.resolve(label + "-raw.sst"), entries, CompressionType.NONE);
+        long packed = writeTable(dir.resolve(label + "-lz4.sst"), entries, CompressionType.LZ4);
+
+        System.out.printf("%-26s %,12d %,12d %7.0f%%%n",
+                label, raw, packed, 100.0 * (raw - packed) / raw);
+        return raw;
+    }
+
+    /** Read throughput against a cache too small to hide decompression. */
+    private static void readCost(Path dir) throws Exception {
+        TreeMap<String, Entry> entries = new TreeMap<>();
+        for (int i = 0; i < COMPRESSION_KEYS; i++) {
+            entries.put(String.format("key_%08d", i),
+                    Entry.put("status=active;tier=free;region=us-east-1"));
+        }
+        Path raw = dir.resolve("cost-raw.sst");
+        Path packed = dir.resolve("cost-lz4.sst");
+        writeTable(raw, entries, CompressionType.NONE);
+        writeTable(packed, entries, CompressionType.LZ4);
+
+        String[] keys = new String[READ_OPS];
+        for (int i = 0; i < READ_OPS; i++) {
+            keys[i] = String.format("key_%08d", i % COMPRESSION_KEYS);
+        }
+
+        System.out.printf("%n%-28s %12s   %10s   %10s%n",
+                "cold reads", "reads/sec", "p50", "p99");
+        System.out.println("-".repeat(68));
+        try (SSTableReader plain = new SSTableReader(raw, new BlockCache(1));
+             SSTableReader compressed = new SSTableReader(packed, new BlockCache(1))) {
+            sample("uncompressed blocks", i -> {
+                try {
+                    plain.get(keys[i]);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            sample("lz4 blocks", i -> {
+                try {
+                    compressed.get(keys[i]);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        }
+    }
+
+    private static long writeTable(Path path, TreeMap<String, Entry> entries,
+            CompressionType type) throws Exception {
+        Files.deleteIfExists(path);
+        try (SSTableWriter writer = SSTableWriter.create(path, entries.size(), type)) {
+            for (var entry : entries.entrySet()) {
+                writer.add(entry.getKey(), entry.getValue());
+            }
+            writer.finish();
+        }
+        return Files.size(path);
+    }
+
+    /** Pseudo-random text, so LZ4 has nothing to find. */
+    private static String noise(int seed) {
+        java.util.Random random = new java.util.Random(seed);
+        StringBuilder out = new StringBuilder(40);
+        for (int i = 0; i < 40; i++) {
+            out.append((char) (0x21 + random.nextInt(94)));
+        }
+        return out.toString();
     }
 
     /** Times an operation, printing throughput and percentiles, returning ops/sec. */

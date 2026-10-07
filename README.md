@@ -179,6 +179,37 @@ A miss whose key falls outside the stored range never consults the filter at
 all, so benchmarking with out-of-range keys measures nothing. The harness uses
 keys that sort between real ones.
 
+## Compression
+
+Blocks are LZ4 compressed. What that saves depends entirely on the data, so
+the benchmark reports several shapes rather than one headline ratio:
+
+| Dataset | Raw | LZ4 | Saving |
+| --- | ---: | ---: | ---: |
+| Repetitive values | 3.14 MB | 393 KB | **87%** |
+| JSON-like values | 2.97 MB | 587 KB | **80%** |
+| Tiny values | 1.17 MB | 332 KB | 72% |
+| High entropy | 3.14 MB | 2.49 MB | 21% |
+
+A block has to compress by at least 10% to be stored compressed; below that it
+is written raw. The point is not the handful of bytes saved, it is that a block
+only worth 2% should not cost a decompression on every read for the rest of its
+life. Blocks record their own encoding, so a file can hold both kinds and a
+reader does not need to be told which to expect.
+
+**Compression also makes cold reads faster, not slower:**
+
+| Cold reads | reads/sec | p99 |
+| --- | ---: | ---: |
+| Uncompressed blocks | 968,000 | 7.25us |
+| LZ4 blocks | 1,063,000 | 6.13us |
+
+That is the opposite of the obvious guess. A compressed block is a fraction of
+the size, so there is far less to read, and LZ4 decompresses faster than the
+saved I/O costs. The cache holds blocks already decompressed, so a cache hit
+pays nothing either way; this comparison uses a cache small enough to miss
+every time, which is the case where compression could have hurt.
+
 ## Design Notes
 
 **Tables are immutable.** That one property does most of the work: a block's
