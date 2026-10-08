@@ -77,6 +77,7 @@ public final class Benchmark {
         run(DurabilityMode.SYNC, 8);
 
         reads();
+        coldReads();
         bloomComparison();
         compression();
 
@@ -192,6 +193,58 @@ public final class Benchmark {
                     withRate / withoutRate);
         }
         delete(dir);
+    }
+
+    /**
+     * Reads once the working set no longer fits in memory.
+     *
+     * <p>The figures above this are all cache hits: a hundred thousand small
+     * keys is a couple of megabytes against a sixteen megabyte cache, so
+     * almost nothing reaches a file. That is a real number for a small store
+     * and a misleading one for anything else, so the same reads are repeated
+     * against caches too small to hold the data.
+     *
+     * <p>What this still does not measure is a cold operating system. The
+     * files stay in the page cache throughout, so these are reads that pay for
+     * block lookup, checksum and decompression but not for a disk seek. A
+     * genuinely cold number would need a dataset larger than RAM.
+     */
+    private static void coldReads() throws Exception {
+        System.out.printf("%n%,d keys, cache sized against the working set%n%n", READ_KEYS);
+        System.out.printf("%-28s %12s   %10s   %10s%n",
+                "block cache", "reads/sec", "p50", "p99");
+        System.out.println("-".repeat(68));
+
+        for (long cache : new long[] {64L * 1024 * 1024, 4L * 1024 * 1024,
+                512L * 1024, 64L * 1024}) {
+            delete(DIR);
+            LSMStoreEngine engine = new LSMStoreEngine(
+                    DIR, 4L * 1024 * 1024, DurabilityMode.BUFFERED, 8, cache);
+            try {
+                for (int i = 0; i < READ_KEYS; i++) {
+                    engine.put(key(i), "value_" + i);
+                }
+                Thread.sleep(3_000);
+
+                String[] keys = new String[READ_OPS];
+                java.util.Random random = new java.util.Random(7);
+                for (int i = 0; i < READ_OPS; i++) {
+                    // Random rather than sequential: sequential access walks a
+                    // block at a time and hides a small cache behind locality.
+                    keys[i] = key(random.nextInt(READ_KEYS));
+                }
+                sample(describeBytes(cache), i -> engine.get(keys[i]));
+            } finally {
+                engine.close();
+            }
+        }
+        delete(DIR);
+    }
+
+    private static String describeBytes(long bytes) {
+        return bytes >= 1024 * 1024
+                ? (bytes / (1024 * 1024)) + " MB"
+                : (bytes / 1024) + " KB";
     }
 
     /**

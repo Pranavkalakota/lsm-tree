@@ -148,10 +148,30 @@ compaction has settled:
 | Hit | 5,150,000 | 0.17us | 0.46us |
 | Miss, key inside the stored range | 6,097,000 | 0.17us | 0.38us |
 
-**These are memory-speed reads, and the number is only honest with that said.**
-100,000 small keys is about 2MB against a 16MB block cache, so the working set
-is resident and almost nothing reaches the disk. A dataset larger than the
-cache would look very different.
+**Those are best-case reads in two ways,** and the number only means something
+with both said: the keys are read in order, which keeps hitting the same block,
+and the whole working set fits in the cache. Both are measured below.
+
+### Reads that miss the cache
+
+The same keys, read in random order, against caches sized against the data:
+
+| Block cache | reads/sec | p50 | p99 |
+| --- | ---: | ---: | ---: |
+| 64MB, holds everything | 2,459,000 | 0.38us | 0.88us |
+| 4MB | 2,679,000 | 0.33us | 0.75us |
+| 512KB | 1,259,000 | 0.71us | 2.21us |
+| 64KB | 1,378,000 | 0.63us | 2.08us |
+
+Two things worth taking from this. Random access costs about half of
+sequential even when everything is cached, because sequential reads keep
+landing in a block that is already open. And once the cache cannot hold the
+working set, throughput halves again and p99 roughly triples.
+
+**What this still does not measure is a cold operating system.** The files stay
+in the page cache throughout, so these reads pay for block lookup, checksum and
+decompression, but not for a disk seek. A number that included one would need a
+dataset larger than RAM.
 
 ### What the bloom filter is worth
 

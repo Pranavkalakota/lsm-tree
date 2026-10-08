@@ -86,7 +86,7 @@ public class LSMStoreEngine implements StorageEngine {
             new AtomicReference<>(List.of());
 
     /** Shared by every reader, so the memory bound belongs to the store. */
-    private final BlockCache blockCache = new BlockCache(DEFAULT_BLOCK_CACHE_SIZE);
+    private final BlockCache blockCache;
 
     /** Guards the read-modify-write of {@link #tables} against flush vs compaction. */
     private final ReentrantLock installLock = new ReentrantLock();
@@ -125,6 +125,18 @@ public class LSMStoreEngine implements StorageEngine {
 
     public LSMStoreEngine(Path dataDir, long memTableMaxSize, DurabilityMode durability,
             int shardCount) {
+        this(dataDir, memTableMaxSize, durability, shardCount, DEFAULT_BLOCK_CACHE_SIZE);
+    }
+
+    /**
+     * @param blockCacheBytes memory for decoded blocks. Sized below the working
+     *                        set, reads start paying for I/O and decompression
+     *                        again, which is the regime a benchmark has to
+     *                        measure if its numbers are to mean anything.
+     */
+    public LSMStoreEngine(Path dataDir, long memTableMaxSize, DurabilityMode durability,
+            int shardCount, long blockCacheBytes) {
+        this.blockCache = new BlockCache(blockCacheBytes);
         try {
             this.dataDir = dataDir;
             Files.createDirectories(dataDir);
