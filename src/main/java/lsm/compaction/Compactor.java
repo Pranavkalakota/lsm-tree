@@ -58,11 +58,28 @@ public final class Compactor {
      * overgrowth slows down every single read.
      */
     public Job choose(List<SSTableReader> tables) {
+        return choose(tables, false);
+    }
+
+    /**
+     * Picks a compaction, optionally relaxing the level 0 trigger.
+     *
+     * <p>The usual trigger waits for four files because compacting sooner
+     * spends write bandwidth a busy store would rather keep. A store with
+     * nothing to write has no such bandwidth to protect, and leaving one or
+     * two files sitting in level 0 means any tombstones in them keep shadowing
+     * values below rather than removing them. Under {@code idle} a single file
+     * is enough.
+     *
+     * @param idle nothing has written recently, so trade write bandwidth for
+     *             space and read speed
+     */
+    public Job choose(List<SSTableReader> tables, boolean idle) {
         int deepest = tables.stream().mapToInt(SSTableReader::level).max().orElse(0);
 
         for (int level = 0; level <= deepest; level++) {
             List<SSTableReader> atLevel = atLevel(tables, level);
-            if (!isOverBudget(atLevel, level)) {
+            if (!isOverBudget(atLevel, level, idle)) {
                 continue;
             }
 
@@ -173,12 +190,12 @@ public final class Compactor {
         return readers;
     }
 
-    private boolean isOverBudget(List<SSTableReader> atLevel, int level) {
+    private boolean isOverBudget(List<SSTableReader> atLevel, int level, boolean idle) {
         if (atLevel.isEmpty()) {
             return false;
         }
         if (level == 0) {
-            return atLevel.size() >= L0_TRIGGER;
+            return atLevel.size() >= (idle ? 1 : L0_TRIGGER);
         }
         long budget = LEVEL1_BYTES;
         for (int i = 1; i < level; i++) {

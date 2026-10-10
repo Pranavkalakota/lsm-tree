@@ -30,6 +30,7 @@ import java.util.Spliterators;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -48,6 +49,27 @@ public class LSMStoreEngine implements StorageEngine {
      * MemTables, which flush more often.
      */
     private static final int DEFAULT_SHARDS = 8;
+
+    /**
+     * Least MemTable a shard is worth having.
+     *
+     * <p>The store's bound is split across shards, so sharding a small one
+     * just makes every shard flush almost immediately: eight shards of a 64
+     * byte MemTable is eight bytes each. Below this the store keeps fewer
+     * shards rather than grinding itself into tiny tables.
+     */
+    private static final long MIN_SHARD_MEMTABLE = 64 * 1024;
+
+    /**
+     * How long the store must go without a write before compaction starts
+     * clearing level 0 below its usual trigger.
+     *
+     * <p>Deliberately not a second or two. A bursty workload pauses constantly,
+     * and treating every pause as idle would spend write bandwidth rewriting
+     * files that are about to be written to again. Half a minute is long
+     * enough to mean the store has actually stopped.
+     */
+    private static final long DEFAULT_IDLE_MILLIS = 30_000;
     private static final long DEFAULT_BLOCK_CACHE_SIZE = 16 * 1024 * 1024; // 16 MB
     private static final String TABLE_SUFFIX = ".sst";
 
@@ -92,9 +114,20 @@ public class LSMStoreEngine implements StorageEngine {
     private final ReentrantLock installLock = new ReentrantLock();
 
     private final AtomicLong nextSequence = new AtomicLong();
+
+    /**
+     * When the last write landed. Compaction leaves a busy store alone and
+     * only reclaims below its trigger once writing has stopped, so this is
+     * the clock it checks.
+     */
+    private volatile long lastWriteNanos = System.nanoTime();
+
+    private final ScheduledExecutorService idleTimer;
+    private final long idleMillis;
     private final Compactor compactor;
     private final ExecutorService compactionThread;
     private final AtomicBoolean compactionQueued = new AtomicBoolean();
+    private final AtomicBoolean idleQueued = new AtomicBoolean();
 
     public LSMStoreEngine(Path dataDir) {
         this(dataDir, DEFAULT_MEMTABLE_SIZE);
@@ -105,7 +138,7 @@ public class LSMStoreEngine implements StorageEngine {
     }
 
     public LSMStoreEngine(Path dataDir, long memTableMaxSize, DurabilityMode durability) {
-        this(dataDir, memTableMaxSize, durability, defaultShards(durability));
+        this(dataDir, memTableMaxSize, durability, defaultShards(durability, memTableMaxSize));
     }
 
     /**
@@ -119,8 +152,12 @@ public class LSMStoreEngine implements StorageEngine {
      * at eight writers. So sharding is applied where it helps and withheld
      * where it does not.
      */
-    private static int defaultShards(DurabilityMode mode) {
-        return mode == DurabilityMode.SYNC ? 1 : DEFAULT_SHARDS;
+    private static int defaultShards(DurabilityMode mode, long memTableMaxSize) {
+        if (mode == DurabilityMode.SYNC) {
+            return 1;
+        }
+        long affordable = Math.max(1, memTableMaxSize / MIN_SHARD_MEMTABLE);
+        return (int) Math.min(DEFAULT_SHARDS, affordable);
     }
 
     public LSMStoreEngine(Path dataDir, long memTableMaxSize, DurabilityMode durability,
@@ -136,7 +173,20 @@ public class LSMStoreEngine implements StorageEngine {
      */
     public LSMStoreEngine(Path dataDir, long memTableMaxSize, DurabilityMode durability,
             int shardCount, long blockCacheBytes) {
+        this(dataDir, memTableMaxSize, durability, shardCount, blockCacheBytes,
+                DEFAULT_IDLE_MILLIS);
+    }
+
+    /**
+     * @param idleMillis quiet period before level 0 is cleared below its usual
+     *                   trigger. Package private because shortening it is only
+     *                   useful to a test that does not want to wait out the
+     *                   real one.
+     */
+    LSMStoreEngine(Path dataDir, long memTableMaxSize, DurabilityMode durability,
+            int shardCount, long blockCacheBytes, long idleMillis) {
         this.blockCache = new BlockCache(blockCacheBytes);
+        this.idleMillis = idleMillis;
         try {
             this.dataDir = dataDir;
             Files.createDirectories(dataDir);
@@ -160,6 +210,13 @@ public class LSMStoreEngine implements StorageEngine {
                 thread.setDaemon(true);
                 return thread;
             });
+            this.idleTimer = Executors.newSingleThreadScheduledExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "lsm-idle");
+                thread.setDaemon(true);
+                return thread;
+            });
+            idleTimer.scheduleWithFixedDelay(this::idleTick,
+                    idleMillis, idleMillis, TimeUnit.MILLISECONDS);
 
             // The bound is for the store, so split it rather than handing each
             // shard the whole thing and using shardCount times the memory.
@@ -167,9 +224,8 @@ public class LSMStoreEngine implements StorageEngine {
             MemTable[] recovered = new MemTable[shardCount];
             for (int i = 0; i < shardCount; i++) {
                 recovered[i] = new MemTable(perShard);
-                WriteAheadLog.replay(dataDir.resolve(walName(i)), recovered[i]);
             }
-            recoverUnshardedLog(recovered);
+            recoverLogs(recovered);
 
             this.shards = new Shard[shardCount];
             for (int i = 0; i < shardCount; i++) {
@@ -220,16 +276,32 @@ public class LSMStoreEngine implements StorageEngine {
     }
 
     /**
-     * Migrates a store written before the log was sharded. Its single wal.log
-     * is replayed and each record routed to the shard that key now belongs to.
+     * Replays every log in the directory and routes each record to the shard
+     * that key belongs to now.
+     *
+     * <p>Replaying log N straight back into shard N would be faster and is
+     * wrong: the shard count is not persisted, so a store written with one
+     * shard and reopened with eight would leave every record in shard zero
+     * while lookups went looking in the shard the key now hashes to. The
+     * records would be on disk and unreachable. Routing on the way in also
+     * covers a store written before the log was sharded at all, whose single
+     * wal.log is just another log to read.
      */
-    private void recoverUnshardedLog(MemTable[] recovered) throws IOException {
-        Path legacy = dataDir.resolve("wal.log");
-        if (!Files.exists(legacy)) {
-            return;
+    private void recoverLogs(MemTable[] recovered) throws IOException {
+        List<Path> logs = new ArrayList<>();
+        try (Stream<Path> files = Files.list(dataDir)) {
+            for (Path path : files.sorted().toList()) {
+                String name = path.getFileName().toString();
+                if (name.startsWith("wal_") || name.equals("wal.log")) {
+                    logs.add(path);
+                }
+            }
         }
+
         MemTable all = new MemTable(Long.MAX_VALUE);
-        WriteAheadLog.replay(legacy, all);
+        for (Path log : logs) {
+            WriteAheadLog.replay(log, all);
+        }
         for (var entry : all.entries().entrySet()) {
             MemTable target = recovered[shardIndex(entry.getKey(), recovered.length)];
             Entry value = entry.getValue();
@@ -238,6 +310,12 @@ public class LSMStoreEngine implements StorageEngine {
             } else {
                 target.put(entry.getKey(), value.value().orElseThrow());
             }
+        }
+
+        // Logs from a different shard count would otherwise be replayed again
+        // on the next open, resurrecting whatever they hold.
+        for (Path log : logs) {
+            Files.deleteIfExists(log);
         }
     }
 
@@ -433,6 +511,8 @@ public class LSMStoreEngine implements StorageEngine {
             shard.lock.unlock();
         }
 
+        lastWriteNanos = System.nanoTime();
+
         // Outside the lock, and now per shard: concurrent writers to different
         // shards commit in parallel instead of queueing behind one another.
         try {
@@ -461,6 +541,7 @@ public class LSMStoreEngine implements StorageEngine {
 
         // Outside the write lock: a compaction in flight may be waiting on the
         // install lock, and holding the write lock here would not help it finish.
+        idleTimer.shutdownNow();
         compactionThread.shutdown();
         try {
             if (!compactionThread.awaitTermination(30, TimeUnit.SECONDS)) {
@@ -551,11 +632,45 @@ public class LSMStoreEngine implements StorageEngine {
         }
     }
 
+    /**
+     * Runs a compaction pass once the store has been quiet long enough.
+     *
+     * <p>Without this, deletes are only ever reclaimed as a side effect of
+     * more writing: a store that goes quiet with two files in level 0 keeps
+     * whatever tombstones they hold, and the values they shadow, forever.
+     */
+    private void idleTick() {
+        if (closed || System.nanoTime() - lastWriteNanos < idleMillis * 1_000_000L) {
+            return;
+        }
+        compactIdleNow();
+    }
+
+    /** Asks for an idle pass now, whatever the clock says. Visible for tests. */
+    void compactIdleNow() {
+        if (closed || !idleQueued.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            compactionThread.execute(() -> compactUntilSettled(true));
+        } catch (RuntimeException e) {
+            idleQueued.set(false);   // executor shutting down
+        }
+    }
+
     private void compactUntilSettled() {
-        compactionQueued.set(false);
+        compactUntilSettled(false);
+    }
+
+    private void compactUntilSettled(boolean idle) {
+        if (idle) {
+            idleQueued.set(false);
+        } else {
+            compactionQueued.set(false);
+        }
         try {
             Compactor.Job job;
-            while (!closed && (job = compactor.choose(tables.get())) != null) {
+            while (!closed && (job = compactor.choose(tables.get(), idle)) != null) {
                 List<SSTableReader> fresh = compactor.open(compactor.run(job));
                 install(fresh, job.inputs());
                 syncDirectory();
