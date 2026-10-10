@@ -115,6 +115,57 @@ class ShardingTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2, 8})
+    void dataSurvivesAReopenAtADifferentShardCount(int shards) {
+        // The shard count is not stored anywhere, and callers reach it
+        // indirectly through the MemTable bound, so it genuinely does change
+        // between opens. Replaying log N back into shard N would leave every
+        // record present on disk and unreachable, because lookups go to the
+        // shard the key hashes to now.
+        LSMStoreEngine engine = new LSMStoreEngine(
+                dir, 4 * 1024 * 1024, DurabilityMode.BUFFERED, shards);
+        try {
+            for (int i = 0; i < 500; i++) {
+                engine.put("key_" + i, "value_" + i);
+            }
+            engine.delete("key_7");
+        } finally {
+            engine.close();
+        }
+
+        for (int reopened : new int[] {16, 3, 1, 8}) {
+            LSMStoreEngine next = new LSMStoreEngine(
+                    dir, 4 * 1024 * 1024, DurabilityMode.BUFFERED, reopened);
+            try {
+                assertEquals(Optional.empty(), next.get("key_7"),
+                        "delete lost moving from " + shards + " to " + reopened + " shards");
+                for (int i = 0; i < 500; i++) {
+                    if (i == 7) {
+                        continue;
+                    }
+                    assertEquals(Optional.of("value_" + i), next.get("key_" + i),
+                            "lost key_" + i + " moving to " + reopened + " shards");
+                }
+            } finally {
+                next.close();
+            }
+        }
+    }
+
+    @Test
+    void theMemtableBoundDecidesHowManyShardsAreWorthHaving() throws IOException {
+        // Splitting a tiny bound eight ways gives each shard almost nothing and
+        // makes every write flush, so a small store keeps fewer shards.
+        LSMStoreEngine small = new LSMStoreEngine(dir, 1024);
+        try {
+            small.put("key", "value");
+            assertEquals(1, logCount(), "a 1KB bound is not worth sharding");
+        } finally {
+            small.close();
+        }
+    }
+
     // --- the logs themselves ---
 
     @Test
