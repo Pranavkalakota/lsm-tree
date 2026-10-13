@@ -3,6 +3,7 @@ package lsm;
 import lsm.compaction.Compactor;
 import lsm.memtable.Entry;
 import lsm.memtable.MemTable;
+import lsm.memtable.VersionedKey;
 import lsm.sstable.BlockCache;
 import lsm.sstable.MergingCursor;
 import lsm.sstable.RowSource;
@@ -116,6 +117,17 @@ public class LSMStoreEngine implements StorageEngine {
     private final AtomicLong nextSequence = new AtomicLong();
 
     /**
+     * The version to stamp on the next write. Separate from {@link #nextSequence},
+     * which numbers files: one counts writes, the other counts tables, and
+     * conflating them would tie a key's history to how often the store flushed.
+     *
+     * <p>Handed out under a shard's lock, so a version is always applied to the
+     * MemTable and the log by the thread that took it, before any other write
+     * in that shard can proceed.
+     */
+    private final AtomicLong nextVersion = new AtomicLong(1);
+
+    /**
      * When the last write landed. Compaction leaves a busy store alone and
      * only reclaims below its trigger once writing has stopped, so this is
      * the clock it checks.
@@ -203,6 +215,11 @@ public class LSMStoreEngine implements StorageEngine {
             }
 
             loadExistingTables();
+            // Above every version any surviving table holds, read from table
+            // metadata rather than by scanning a single data block.
+            for (SSTableReader table : tables.get()) {
+                nextVersion.updateAndGet(current -> Math.max(current, table.maxVersion() + 1));
+            }
 
             this.compactor = new Compactor(dataDir, blockCache, nextSequence::getAndIncrement);
             this.compactionThread = Executors.newSingleThreadExecutor(runnable -> {
@@ -226,6 +243,9 @@ public class LSMStoreEngine implements StorageEngine {
                 recovered[i] = new MemTable(perShard);
             }
             recoverLogs(recovered);
+            for (MemTable table : recovered) {
+                nextVersion.updateAndGet(current -> Math.max(current, table.maxVersion() + 1));
+            }
 
             this.shards = new Shard[shardCount];
             for (int i = 0; i < shardCount; i++) {
@@ -234,12 +254,15 @@ public class LSMStoreEngine implements StorageEngine {
                 // then write the recovered state back into it.
                 Files.deleteIfExists(walPath);
                 WriteAheadLog wal = new WriteAheadLog(walPath, durability);
-                for (var entry : recovered[i].entries().entrySet()) {
+                // Every version, not just the newest: a snapshot read depends
+                // on the history, so recovery has to put all of it back.
+                for (var entry : recovered[i].versionedEntries().entrySet()) {
+                    VersionedKey key = entry.getKey();
                     Entry e = entry.getValue();
                     if (e.isTombstone()) {
-                        wal.appendDelete(entry.getKey());
+                        wal.appendDelete(key.key(), key.version());
                     } else {
-                        wal.appendPut(entry.getKey(), e.value().orElseThrow());
+                        wal.appendPut(key.key(), e.value().orElseThrow(), key.version());
                     }
                 }
                 shards[i] = new Shard(recovered[i], wal);
@@ -302,13 +325,14 @@ public class LSMStoreEngine implements StorageEngine {
         for (Path log : logs) {
             WriteAheadLog.replay(log, all);
         }
-        for (var entry : all.entries().entrySet()) {
-            MemTable target = recovered[shardIndex(entry.getKey(), recovered.length)];
+        for (var entry : all.versionedEntries().entrySet()) {
+            VersionedKey key = entry.getKey();
+            MemTable target = recovered[shardIndex(key.key(), recovered.length)];
             Entry value = entry.getValue();
             if (value.isTombstone()) {
-                target.delete(entry.getKey());
+                target.delete(key.key(), key.version());
             } else {
-                target.put(entry.getKey(), value.value().orElseThrow());
+                target.put(key.key(), value.value().orElseThrow(), key.version());
             }
         }
 
@@ -497,12 +521,16 @@ public class LSMStoreEngine implements StorageEngine {
         shard.lock.lock();
         try {
             checkNotClosed();
+            // Taken inside the lock, so every version handed out has been
+            // applied by the time the lock is released. Nothing can observe a
+            // version that exists but has not landed yet.
+            long version = nextVersion.getAndIncrement();
             if (isPut) {
-                seq = shard.wal.appendPut(key, value);
-                shard.memTable.put(key, value);
+                seq = shard.wal.appendPut(key, value, version);
+                shard.memTable.put(key, value, version);
             } else {
-                seq = shard.wal.appendDelete(key);
-                shard.memTable.delete(key);
+                seq = shard.wal.appendDelete(key, version);
+                shard.memTable.delete(key, version);
             }
             flushIfFull(shard);
         } catch (IOException e) {
@@ -591,7 +619,7 @@ public class LSMStoreEngine implements StorageEngine {
         // against each other correctly in the read path.
         Path path = dataDir.resolve(
                 String.format("L0_%06d%s", nextSequence.getAndIncrement(), TABLE_SUFFIX));
-        SSTableWriter.write(path, shard.memTable.entries());
+        SSTableWriter.writeVersioned(path, shard.memTable.versionedEntries());
         syncDirectory();
 
         install(List.of(new SSTableReader(path, blockCache)), List.of());

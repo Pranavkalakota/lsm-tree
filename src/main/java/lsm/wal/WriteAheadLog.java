@@ -27,6 +27,19 @@ public class WriteAheadLog implements Closeable {
 
     private static final byte OP_PUT = 1;
     private static final byte OP_DELETE = 2;
+
+    /**
+     * Versioned forms of the two operations above, carrying the version the
+     * write was issued at.
+     *
+     * <p>New codes rather than a new record layout, so a log written before
+     * versions existed still replays: its records land at version zero, which
+     * is what they are. Changing the layout in place would have made every
+     * such log unparseable, and the one time that matters is a crash, which is
+     * the worst time to discover it.
+     */
+    private static final byte OP_PUT_AT = 3;
+    private static final byte OP_DELETE_AT = 4;
     private static final int MAX_KEY_SIZE = 10 * 1024 * 1024;
     private static final int MAX_VALUE_SIZE = 100 * 1024 * 1024;
 
@@ -68,13 +81,23 @@ public class WriteAheadLog implements Closeable {
      * has to match the order the MemTable saw.
      */
     public long appendPut(String key, String value) throws IOException {
+        return appendPut(key, value, 0);
+    }
+
+    /**
+     * Appends a put at a version and returns its sequence number, which
+     * {@link #syncTo} can later be asked to commit. Callers must serialize
+     * appends; the log's order has to match the order the MemTable saw.
+     */
+    public long appendPut(String key, String value, long version) throws IOException {
         checkNotClosed();
         byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
         byte[] valBytes = value.getBytes(StandardCharsets.UTF_8);
 
-        // One buffer for the whole record: [op:1][keyLen:4][key][valLen:4][val]
-        ByteBuffer buf = ByteBuffer.allocate(1 + 4 + keyBytes.length + 4 + valBytes.length);
-        buf.put(OP_PUT);
+        // [op:1][version:8][keyLen:4][key][valLen:4][val]
+        ByteBuffer buf = ByteBuffer.allocate(1 + 8 + 4 + keyBytes.length + 4 + valBytes.length);
+        buf.put(OP_PUT_AT);
+        buf.putLong(version);
         buf.putInt(keyBytes.length);
         buf.put(keyBytes);
         buf.putInt(valBytes.length);
@@ -84,11 +107,17 @@ public class WriteAheadLog implements Closeable {
 
     /** Appends a delete. See {@link #appendPut} for the ordering contract. */
     public long appendDelete(String key) throws IOException {
+        return appendDelete(key, 0);
+    }
+
+    /** Appends a delete at a version. */
+    public long appendDelete(String key, long version) throws IOException {
         checkNotClosed();
         byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
 
-        ByteBuffer buf = ByteBuffer.allocate(1 + 4 + keyBytes.length);
-        buf.put(OP_DELETE);
+        ByteBuffer buf = ByteBuffer.allocate(1 + 8 + 4 + keyBytes.length);
+        buf.put(OP_DELETE_AT);
+        buf.putLong(version);
         buf.putInt(keyBytes.length);
         buf.put(keyBytes);
         return writeRecord(buf);
@@ -157,6 +186,16 @@ public class WriteAheadLog implements Closeable {
             while (in.available() > 0) {
                 try {
                     byte op = in.readByte();
+                    if (op != OP_PUT && op != OP_DELETE
+                            && op != OP_PUT_AT && op != OP_DELETE_AT) {
+                        break;
+                    }
+                    // Only the versioned forms carry one; the older ones are
+                    // version zero by definition.
+                    long version = (op == OP_PUT_AT || op == OP_DELETE_AT) ? in.readLong() : 0;
+                    if (version < 0) {
+                        break;
+                    }
 
                     int keyLen = in.readInt();
                     if (keyLen < 0 || keyLen > MAX_KEY_SIZE) {
@@ -166,18 +205,16 @@ public class WriteAheadLog implements Closeable {
                     in.readFully(keyBytes);
                     String key = new String(keyBytes, StandardCharsets.UTF_8);
 
-                    if (op == OP_PUT) {
+                    if (op == OP_PUT || op == OP_PUT_AT) {
                         int valLen = in.readInt();
                         if (valLen < 0 || valLen > MAX_VALUE_SIZE) {
                             break;
                         }
                         byte[] valBytes = new byte[valLen];
                         in.readFully(valBytes);
-                        memTable.put(key, new String(valBytes, StandardCharsets.UTF_8));
-                    } else if (op == OP_DELETE) {
-                        memTable.delete(key);
+                        memTable.put(key, new String(valBytes, StandardCharsets.UTF_8), version);
                     } else {
-                        break;
+                        memTable.delete(key, version);
                     }
                 } catch (EOFException e) {
                     break;

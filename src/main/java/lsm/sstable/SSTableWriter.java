@@ -139,7 +139,23 @@ public final class SSTableWriter implements Closeable {
         return create(path, expectedKeys, CompressionType.LZ4);
     }
 
-    /** Writes an entire sorted map as one table. */
+    /**
+     * Writes an entire sorted map of versioned records as one table.
+     *
+     * <p>A separate name rather than an overload, because both maps erase to
+     * {@code Map} and the compiler cannot tell them apart.
+     */
+    public static void writeVersioned(Path path, Map<VersionedKey, Entry> sortedEntries)
+            throws IOException {
+        try (SSTableWriter writer = create(path, sortedEntries.size())) {
+            for (Map.Entry<VersionedKey, Entry> entry : sortedEntries.entrySet()) {
+                writer.add(entry.getKey(), entry.getValue());
+            }
+            writer.finish();
+        }
+    }
+
+    /** Writes an entire sorted map as one table, every record at version zero. */
     public static void write(Path path, Map<String, Entry> sortedEntries) throws IOException {
         try (SSTableWriter writer = create(path, sortedEntries.size())) {
             for (Map.Entry<String, Entry> entry : sortedEntries.entrySet()) {

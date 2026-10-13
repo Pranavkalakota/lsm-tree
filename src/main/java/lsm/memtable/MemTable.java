@@ -29,6 +29,7 @@ public class MemTable {
 
     private final ConcurrentSkipListMap<VersionedKey, Entry> data = new ConcurrentSkipListMap<>();
     private final AtomicLong sizeBytes = new AtomicLong();
+    private final AtomicLong maxVersion = new AtomicLong();
     private final long maxSizeBytes;
 
     public MemTable(long maxSizeBytes) {
@@ -38,6 +39,7 @@ public class MemTable {
     /** Writes a value at a version. Versions are the engine's to hand out. */
     public void put(String key, String value, long version) {
         Entry entry = Entry.put(value);
+        maxVersion.accumulateAndGet(version, Math::max);
         Entry previous = data.put(new VersionedKey(key, version), entry);
         sizeBytes.addAndGet(previous == null
                 ? keySize(key) + entry.sizeBytes()
@@ -46,6 +48,7 @@ public class MemTable {
 
     /** Marks a key deleted at a version. */
     public void delete(String key, long version) {
+        maxVersion.accumulateAndGet(version, Math::max);
         Entry previous = data.put(new VersionedKey(key, version), Entry.tombstone());
         sizeBytes.addAndGet(previous == null ? keySize(key) : -previous.sizeBytes());
     }
@@ -105,6 +108,23 @@ public class MemTable {
         return data.size();
     }
 
+    /**
+     * The highest version written here, or zero if nothing was. Recovery uses
+     * it to resume issuing versions above everything a replayed log held.
+     */
+    public long maxVersion() {
+        return maxVersion.get();
+    }
+
+    /**
+     * Every version of every key, in stored order: keys ascending, and a key's
+     * versions newest first. This is what a flush writes, so the history a
+     * snapshot read depends on survives leaving memory.
+     */
+    public Map<VersionedKey, Entry> versionedEntries() {
+        return Collections.unmodifiableMap(data);
+    }
+
     public boolean isEmpty() {
         return data.isEmpty();
     }
@@ -145,6 +165,8 @@ public class MemTable {
     public void clear() {
         data.clear();
         sizeBytes.set(0);
+        // maxVersion deliberately survives: versions are global and must keep
+        // climbing, while this map is only what has not been flushed yet.
     }
 
     /**

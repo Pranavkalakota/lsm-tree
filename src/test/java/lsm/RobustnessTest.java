@@ -118,8 +118,9 @@ class RobustnessTest {
         // Corrupt the op byte of the second record by replacing it
         // with an invalid op code (0xFF)
         byte[] walBytes = Files.readAllBytes(walPath);
-        // First record: 1 byte op + 4 bytes keyLen + 5 bytes "first" + 4 bytes valLen + 2 bytes "ok" = 16
-        int secondRecordOffset = 1 + 4 + 5 + 4 + 2;
+        // First record: 1 byte op + 8 bytes version + 4 bytes keyLen
+        // + 5 bytes "first" + 4 bytes valLen + 2 bytes "ok" = 24
+        int secondRecordOffset = 1 + 8 + 4 + 5 + 4 + 2;
         walBytes[secondRecordOffset] = (byte) 0xFF;
         Files.write(walPath, walBytes);
 
