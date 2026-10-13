@@ -3,6 +3,7 @@ package lsm.sstable;
 import com.google.common.hash.BloomFilter;
 import com.google.common.hash.Funnels;
 import lsm.memtable.Entry;
+import lsm.memtable.VersionedKey;
 
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
@@ -29,9 +30,9 @@ import java.util.zip.CRC32C;
  * <pre>
  * [block]*       [type:1][rawLen:4][payload][crc32c:4]
  *                payload is the records, compressed unless that did not pay
- *                record: [keyLen:4][key][tombstone:1][valLen:4][val]
- * [index block]  one entry per block: [keyLen:4][firstKey][offset:8][length:4]
- * [metadata]     [entryCount:8][maxKeyLen:4][maxKey][bloomLen:4][bloom]
+ *                record: [keyLen:4][key][version:8][tombstone:1][valLen:4][val]
+ * [index block]  one entry per block: [keyLen:4][firstKey][version:8][offset:8][length:4]
+ * [metadata]     [entryCount:8][maxVersion:8][maxKeyLen:4][maxKey][bloomLen:4][bloom]
  * [footer]       [indexOffset:8][blockCount:4][metaOffset:8][formatVersion:4][magic:8]
  * </pre>
  *
@@ -65,7 +66,7 @@ public final class SSTableWriter implements Closeable {
     /** "LSMSST" plus a two byte tag; trailing bytes of every well-formed file. */
     public static final long MAGIC = 0x4C534D5353543031L;
 
-    public static final int FORMAT_VERSION = 5;
+    public static final int FORMAT_VERSION = 6;
 
     /** [type:1][rawLen:4] in front of every block's payload. */
     public static final int BLOCK_HEADER_SIZE = 5;
@@ -104,10 +105,11 @@ public final class SSTableWriter implements Closeable {
     private final BloomFilter<CharSequence> bloom;
     private final CompressionType compression;
 
-    private String firstKey;
-    private String lastKey;
+    private VersionedKey firstKey;
+    private VersionedKey lastKey;
     private long offset;
     private long entryCount;
+    private long maxVersion;
     private boolean finished;
 
     /** Opens a writer, sizing the bloom filter for a guess of 1000 keys. */
@@ -160,11 +162,21 @@ public final class SSTableWriter implements Closeable {
     }
 
     /**
-     * Appends one entry. Keys must arrive in ascending order, since the reader's
-     * binary search over block boundaries assumes it; a key that goes backwards
-     * is rejected here rather than producing a table that silently loses lookups.
+     * Appends one entry at version zero, for callers with no versions of their
+     * own. Keys must still arrive in ascending order.
      */
     public void add(String key, Entry value) throws IOException {
+        add(new VersionedKey(key, 0), value);
+    }
+
+    /**
+     * Appends one version of one key. Records must arrive in {@link VersionedKey}
+     * order: keys ascending, and a key's versions newest first. The reader's
+     * binary search over block boundaries assumes it, so a record that goes
+     * backwards is rejected here rather than producing a table that silently
+     * loses lookups.
+     */
+    public void add(VersionedKey key, Entry value) throws IOException {
         if (finished) {
             throw new IOException("SSTable already finished: " + path);
         }
@@ -175,16 +187,18 @@ public final class SSTableWriter implements Closeable {
         if (firstKey == null) {
             firstKey = key;
         }
-        bloom.put(key);
+        bloom.put(key.key());
         entryCount++;
+        maxVersion = Math.max(maxVersion, key.version());
 
-        byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+        byte[] keyBytes = key.key().getBytes(StandardCharsets.UTF_8);
         byte[] valBytes = value.isTombstone()
                 ? NO_BYTES
                 : value.value().orElseThrow().getBytes(StandardCharsets.UTF_8);
 
         blockOut.writeInt(keyBytes.length);
         blockOut.write(keyBytes);
+        blockOut.writeLong(key.version());
         blockOut.writeByte(value.isTombstone() ? 1 : 0);
         blockOut.writeInt(valBytes.length);
         blockOut.write(valBytes);
@@ -207,21 +221,25 @@ public final class SSTableWriter implements Closeable {
         long indexBytes = 0;
         DataOutputStream tail = new DataOutputStream(out);
         for (BlockRef ref : index) {
-            byte[] key = ref.firstKey.getBytes(StandardCharsets.UTF_8);
+            byte[] key = ref.firstKey.key().getBytes(StandardCharsets.UTF_8);
             tail.writeInt(key.length);
             tail.write(key);
+            tail.writeLong(ref.firstKey.version());
             tail.writeLong(ref.offset);
             tail.writeInt(ref.length);
-            indexBytes += 4 + key.length + 8 + 4;
+            indexBytes += 4 + key.length + 8 + 8 + 4;
         }
 
         byte[] maxKey = lastKey == null
                 ? NO_BYTES
-                : lastKey.getBytes(StandardCharsets.UTF_8);
+                : lastKey.key().getBytes(StandardCharsets.UTF_8);
         ByteArrayOutputStream bloomBytes = new ByteArrayOutputStream();
         bloom.writeTo(bloomBytes);
 
         tail.writeLong(entryCount);
+        // Recorded so the engine can resume issuing versions above every one
+        // already on disk without reading a single data block.
+        tail.writeLong(maxVersion);
         tail.writeInt(maxKey.length);
         tail.write(maxKey);
         tail.writeInt(bloomBytes.size());
@@ -286,6 +304,6 @@ public final class SSTableWriter implements Closeable {
         firstKey = null;
     }
 
-    private record BlockRef(String firstKey, long offset, int length) {
+    private record BlockRef(VersionedKey firstKey, long offset, int length) {
     }
 }

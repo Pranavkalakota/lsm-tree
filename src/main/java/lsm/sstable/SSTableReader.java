@@ -3,6 +3,7 @@ package lsm.sstable;
 import com.google.common.hash.BloomFilter;
 import com.google.common.hash.Funnels;
 import lsm.memtable.Entry;
+import lsm.memtable.VersionedKey;
 
 import java.io.ByteArrayInputStream;
 import java.io.EOFException;
@@ -34,7 +35,7 @@ public final class SSTableReader implements AutoCloseable {
     private final Path path;
     private final FileChannel channel;
     private final BlockCache cache;
-    private final String[] firstKeys;
+    private final VersionedKey[] firstKeys;
     private final long[] blockOffsets;
     private final int[] blockLengths;
 
@@ -43,6 +44,7 @@ public final class SSTableReader implements AutoCloseable {
     private final String minKey;
     private final String maxKey;
     private final long entryCount;
+    private final long maxVersion;
 
     /**
      * Says a key is definitely absent, or probably present. The negative answer
@@ -98,17 +100,18 @@ public final class SSTableReader implements AutoCloseable {
                 throw new IOException("Corrupt SSTable footer: " + path);
             }
 
-            this.firstKeys = new String[blockCount];
+            this.firstKeys = new VersionedKey[blockCount];
             this.blockOffsets = new long[blockCount];
             this.blockLengths = new int[blockCount];
             loadIndex(indexOffset, (int) (metaOffset - indexOffset), blockCount, indexOffset);
 
             this.level = parseLevel(path);
             this.sequence = parseSequence(path);
-            this.minKey = blockCount == 0 ? null : firstKeys[0];
+            this.minKey = blockCount == 0 ? null : firstKeys[0].key();
 
             ByteBuffer meta = read(metaOffset, (int) (metaEnd - metaOffset));
-            this.entryCount = readEntryCount(meta);
+            this.entryCount = readLong(meta);
+            this.maxVersion = readLong(meta);
             this.maxKey = readMaxKey(meta);
             this.bloom = readBloom(meta);
         } catch (IOException e) {
@@ -117,7 +120,7 @@ public final class SSTableReader implements AutoCloseable {
         }
     }
 
-    private long readEntryCount(ByteBuffer meta) throws IOException {
+    private long readLong(ByteBuffer meta) throws IOException {
         if (meta.remaining() < 8) {
             throw new IOException("Corrupt SSTable metadata: " + path);
         }
@@ -193,37 +196,58 @@ public final class SSTableReader implements AutoCloseable {
      * @throws IOException if the block holding the key fails its checksum
      */
     public Entry get(String key) throws IOException {
+        return get(key, VersionedKey.NEWEST);
+    }
+
+    /**
+     * Returns what a reader at {@code snapshot} should see for {@code key}: the
+     * newest version written at or before it, which may be a tombstone, or
+     * {@code null} when the table held no such version.
+     *
+     * <p>Versions of a key descend, so the first record at or after
+     * {@code (key, snapshot)} is already the answer, and newer versions sort
+     * ahead of the seek and are stepped over without their values being copied.
+     *
+     * @throws IOException if a block holding the key fails its checksum
+     */
+    public Entry get(String key, long snapshot) throws IOException {
         if (!bloom.mightContain(key)) {
             return null;
         }
-        int slot = indexSlot(key);
-        if (slot < 0) {
-            return null;
-        }
-        ByteBuffer block = readBlock(slot);
+        VersionedKey seek = new VersionedKey(key, snapshot);
 
-        while (block.remaining() > 0) {
-            int keyLen = block.getInt();
-            byte[] keyBytes = new byte[keyLen];
-            block.get(keyBytes);
-            boolean tombstone = block.get() == 1;
-            int valLen = block.getInt();
+        // The record wanted is in this block or starts the next one, and the
+        // index guarantees it is no further than that, so this looks at two
+        // blocks at most and at one in every case but a key whose versions
+        // straddle a boundary.
+        int slot = Math.max(indexSlot(seek), 0);
+        for (int block = slot; block < blockOffsets.length && block <= slot + 1; block++) {
+            ByteBuffer records = readBlock(block);
+            while (records.remaining() > 0) {
+                int keyLen = records.getInt();
+                byte[] keyBytes = new byte[keyLen];
+                records.get(keyBytes);
+                long version = records.getLong();
+                boolean tombstone = records.get() == 1;
+                int valLen = records.getInt();
 
-            int cmp = new String(keyBytes, StandardCharsets.UTF_8).compareTo(key);
-            if (cmp == 0) {
-                if (tombstone) {
-                    return Entry.tombstone();
+                VersionedKey found =
+                        new VersionedKey(new String(keyBytes, StandardCharsets.UTF_8), version);
+                if (found.compareTo(seek) >= 0) {
+                    if (!found.hasKey(key)) {
+                        // Past the key's own history, so it had no version this
+                        // old and no later block can hold one either.
+                        return null;
+                    }
+                    if (tombstone) {
+                        return Entry.tombstone();
+                    }
+                    byte[] val = new byte[valLen];
+                    records.get(val);
+                    return Entry.put(new String(val, StandardCharsets.UTF_8));
                 }
-                byte[] val = new byte[valLen];
-                block.get(val);
-                return Entry.put(new String(val, StandardCharsets.UTF_8));
+                records.position(records.position() + valLen);
             }
-            if (cmp > 0) {
-                // Keys ascend, so anything further in this block is past the
-                // target, and the index guarantees later blocks start later still.
-                return null;
-            }
-            block.position(block.position() + valLen);
         }
         return null;
     }
@@ -262,6 +286,15 @@ public final class SSTableReader implements AutoCloseable {
     /** Entries stored, tombstones included. Sizes a compaction's bloom filter. */
     public long entryCount() {
         return entryCount;
+    }
+
+    /**
+     * The highest version any record here carries, or zero for a table written
+     * before versions existed. Read from the metadata, so recovering the
+     * engine's version counter costs no data blocks.
+     */
+    public long maxVersion() {
+        return maxVersion;
     }
 
     /** False when the key is definitely absent; true means it may be present. */
@@ -346,17 +379,40 @@ public final class SSTableReader implements AutoCloseable {
      * instead of the whole file.
      */
     public Cursor cursorFrom(String fromKey) throws IOException {
-        int slot = indexSlot(fromKey);
+        // Positioned at the newest version of the key, so a scan starting here
+        // sees the key's current value first and its history after.
+        VersionedKey seek = VersionedKey.newest(fromKey);
+        int slot = indexSlot(seek);
         // A key before every block means the scan starts at the first one.
         Cursor cursor = new Cursor(Math.max(slot, 0));
-        while (cursor.hasNext() && cursor.current().key().compareTo(fromKey) < 0) {
+        while (cursor.hasNext() && cursor.current().versionedKey().compareTo(seek) < 0) {
             cursor.next();
         }
         return cursor;
     }
 
-    /** One entry of a table: the key, and the value or tombstone stored for it. */
-    public record Row(String key, Entry value) {
+    /**
+     * One record of a table: which version of which key, and the value or
+     * tombstone stored for it.
+     *
+     * <p>{@link #key} gives the key on its own, which is what a caller that
+     * does not care about versions wants, and is why most of them read as
+     * though versions were never added.
+     */
+    public record Row(VersionedKey versionedKey, Entry value) {
+
+        /** A row at version zero, for callers with no versions of their own. */
+        public Row(String key, Entry value) {
+            this(new VersionedKey(key, 0), value);
+        }
+
+        public String key() {
+            return versionedKey.key();
+        }
+
+        public long version() {
+            return versionedKey.version();
+        }
     }
 
     /** Forward-only walk over a table's entries. Not thread safe; make one per scan. */
@@ -402,10 +458,12 @@ public final class SSTableReader implements AutoCloseable {
             int keyLen = records.getInt();
             byte[] keyBytes = new byte[keyLen];
             records.get(keyBytes);
+            long version = records.getLong();
             boolean tombstone = records.get() == 1;
             int valLen = records.getInt();
 
-            String key = new String(keyBytes, StandardCharsets.UTF_8);
+            VersionedKey key =
+                    new VersionedKey(new String(keyBytes, StandardCharsets.UTF_8), version);
             if (tombstone) {
                 current = new Row(key, Entry.tombstone());
                 return;
@@ -471,12 +529,16 @@ public final class SSTableReader implements AutoCloseable {
                 throw new IOException("Truncated SSTable index: " + path);
             }
             int keyLen = buf.getInt();
-            if (keyLen < 0 || buf.remaining() < keyLen + 12) {
+            if (keyLen < 0 || buf.remaining() < keyLen + 20) {
                 throw new IOException("Truncated SSTable index: " + path);
             }
             byte[] keyBytes = new byte[keyLen];
             buf.get(keyBytes);
-            firstKeys[i] = new String(keyBytes, StandardCharsets.UTF_8);
+            long version = buf.getLong();
+            if (version < 0) {
+                throw new IOException("Corrupt SSTable index entry " + i + " in " + path);
+            }
+            firstKeys[i] = new VersionedKey(new String(keyBytes, StandardCharsets.UTF_8), version);
             blockOffsets[i] = buf.getLong();
             blockLengths[i] = buf.getInt();
 
@@ -489,12 +551,16 @@ public final class SSTableReader implements AutoCloseable {
     }
 
     /**
-     * Index of the last block whose first key is less than or equal to
-     * {@code key}, or -1 when {@code key} sorts before every key in the table.
-     * Ordering uses {@link String#compareTo}, matching the TreeMap order the
-     * writer relies on.
+     * Index of the last block whose first record is at or before {@code key},
+     * or -1 when {@code key} sorts before every record in the table.
+     *
+     * <p>Ordering is {@link VersionedKey}'s, matching the order the writer
+     * emitted records in. Because the following block already starts after
+     * {@code key}, the first record at or after {@code key} is either in the
+     * block this returns or is the first record of the one after it, and never
+     * further away than that.
      */
-    private int indexSlot(String key) {
+    private int indexSlot(VersionedKey key) {
         int lo = 0;
         int hi = firstKeys.length - 1;
         int slot = -1;

@@ -150,7 +150,7 @@ public final class Compactor {
                     writtenBytes = 0;
                 }
 
-                writer.add(row.key(), row.value());
+                writer.add(row.versionedKey(), row.value());
                 writtenBytes += row.key().length()
                         + row.value().value().map(String::length).orElse(0);
 
