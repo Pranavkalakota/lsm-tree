@@ -415,14 +415,17 @@ public class LSMStoreEngine implements StorageEngine {
         // Keys scatter across shards, so a range can start in any of them.
         // Merged into one sorted view first, which also keeps them ahead of
         // every table in the merge order.
-        TreeMap<String, Entry> buffered = new TreeMap<>();
+        // Keyed by version as well as key, because the merge orders records
+        // that way and these have to interleave correctly with stored tables.
+        TreeMap<VersionedKey, Entry> buffered = new TreeMap<>();
         for (Shard shard : shards) {
-            buffered.putAll(shard.memTable.range(fromInclusive, toExclusive));
+            buffered.putAll(shard.memTable.versionedRange(
+                    fromInclusive, toExclusive, VersionedKey.NEWEST));
         }
 
         List<SSTableReader> held = new ArrayList<>();
         List<RowSource> sources = new ArrayList<>();
-        sources.add(RowSource.of(buffered.entrySet().iterator()));
+        sources.add(RowSource.ofVersioned(buffered.entrySet().iterator()));
 
         try {
             for (SSTableReader table : tables.get()) {
@@ -453,6 +456,10 @@ public class LSMStoreEngine implements StorageEngine {
     /** Drops tombstones and stops at the upper bound; keys ascend, so it can stop early. */
     private Iterator<Row> rows(MergingCursor merged, String toExclusive) {
         return new Iterator<>() {
+            // Declared before pending, whose initializer calls advance() and
+            // writes this; the other order would reset it straight afterwards.
+            private String decided;
+
             private Row pending = advance();
 
             private Row advance() {
@@ -462,6 +469,14 @@ public class LSMStoreEngine implements StorageEngine {
                         if (toExclusive != null && row.key().compareTo(toExclusive) >= 0) {
                             return null;
                         }
+                        // The merge hands over a key's whole history, newest
+                        // first, so the first record settles the key and the
+                        // rest of its run is skipped. A tombstone settles it
+                        // too, by deciding the key has no value to return.
+                        if (row.key().equals(decided)) {
+                            continue;
+                        }
+                        decided = row.key();
                         if (!row.value().isTombstone()) {
                             return new Row(row.key(), row.value().value().orElseThrow());
                         }

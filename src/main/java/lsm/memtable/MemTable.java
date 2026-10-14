@@ -146,13 +146,36 @@ public class MemTable {
      */
     public Map<String, Entry> range(String fromInclusive, String toExclusive, long snapshot) {
         Map<String, Entry> visible = new LinkedHashMap<>();
+        versionedRange(fromInclusive, toExclusive, snapshot)
+                .forEach((key, entry) -> visible.put(key.key(), entry));
+        return Collections.unmodifiableMap(visible);
+    }
+
+    /**
+     * The same as {@link #range(String, String, long)}, but each key keeps the
+     * version it was actually written at.
+     *
+     * <p>A merge orders records by version, so a caller feeding these into one
+     * alongside stored tables has to hand over the real versions. Flattening
+     * them to zero would sort a live in-memory value behind a stale one on
+     * disk, and the stale one would win.
+     */
+    public Map<VersionedKey, Entry> versionedRange(String fromInclusive, String toExclusive,
+            long snapshot) {
+        Map<VersionedKey, Entry> visible = new LinkedHashMap<>();
+        String lastKey = null;
         for (Map.Entry<VersionedKey, Entry> entry : bounded(fromInclusive, toExclusive).entrySet()) {
-            if (entry.getKey().version() > snapshot) {
+            VersionedKey key = entry.getKey();
+            if (key.version() > snapshot) {
                 continue;   // written after this reader started; not its business
             }
-            // Versions descend, so the first one that is visible is the newest
-            // that is, and later ones for the same key are its older history.
-            visible.putIfAbsent(entry.getKey().key(), entry.getValue());
+            // Versions descend, so the first visible one is the newest visible
+            // one, and the rest of that key's run is its older history.
+            if (lastKey != null && key.hasKey(lastKey)) {
+                continue;
+            }
+            lastKey = key.key();
+            visible.put(key, entry.getValue());
         }
         return Collections.unmodifiableMap(visible);
     }

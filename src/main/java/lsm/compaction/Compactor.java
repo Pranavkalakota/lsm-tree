@@ -15,6 +15,14 @@ import java.util.function.LongSupplier;
 /**
  * Chooses and performs leveled compactions.
  *
+ * <p>A merge keeps every version of a key that a live reader could still ask
+ * for, and collapses the rest. Concretely: every version newer than the oldest
+ * live snapshot survives, plus the newest version at or below it, because that
+ * is the one a reader holding the oldest snapshot would land on. Everything
+ * older than that is unreachable and goes. With no snapshots open the rule
+ * degenerates to keeping only the current value, which is what a store without
+ * MVCC did all along.
+ *
  * <p>Level 0 holds whole MemTable snapshots, so its tables overlap each other
  * freely and a lookup has to consult all of them. Every level below holds
  * tables with disjoint key ranges, so at most one table per level can contain a
@@ -42,10 +50,25 @@ public final class Compactor {
     private final BlockCache blockCache;
     private final LongSupplier nextSequence;
 
+    /**
+     * The oldest version any live reader can still ask for. Versions below it
+     * are history nobody is entitled to see, which is the only thing that
+     * makes discarding them safe.
+     */
+    private final LongSupplier oldestSnapshot;
+
     public Compactor(Path dataDir, BlockCache blockCache, LongSupplier nextSequence) {
+        // No snapshots means nothing can ask for an old version, so every key
+        // collapses to its current value.
+        this(dataDir, blockCache, nextSequence, () -> Long.MAX_VALUE);
+    }
+
+    public Compactor(Path dataDir, BlockCache blockCache, LongSupplier nextSequence,
+            LongSupplier oldestSnapshot) {
         this.dataDir = dataDir;
         this.blockCache = blockCache;
         this.nextSequence = nextSequence;
+        this.oldestSnapshot = oldestSnapshot;
     }
 
     /** The inputs of one compaction, and where its output belongs. */
@@ -135,11 +158,38 @@ public final class Compactor {
         SSTableWriter writer = null;
         long writtenBytes = 0;
 
+        // Everything at or below this is history no reader is entitled to, so
+        // only the newest such version of a key has to survive. Read once, not
+        // per row: a snapshot opening midway through a merge must not change
+        // what the rest of that merge decides to keep.
+        long watermark = oldestSnapshot.getAsLong();
+        String previousKey = null;
+        boolean keptWatermarkVersion = false;
+
         try (MergingCursor merged = new MergingCursor(cursors)) {
             while (merged.hasNext()) {
                 SSTableReader.Row row = merged.next();
-                if (row.value().isTombstone() && job.mayDropTombstones()) {
-                    continue;
+
+                if (!row.key().equals(previousKey)) {
+                    previousKey = row.key();
+                    keptWatermarkVersion = false;
+                }
+
+                // Above the watermark some live reader may still arrive at it,
+                // so it is kept untouched. At or below, only the first one seen
+                // matters: that is the newest such version, and versions
+                // descend, so everything after it is deeper history.
+                if (row.version() <= watermark) {
+                    if (keptWatermarkVersion) {
+                        continue;
+                    }
+                    keptWatermarkVersion = true;
+                    // Safe to drop only here: this is the version a reader at
+                    // the watermark would land on, and at the bottom level no
+                    // value survives underneath for the delete to have to hide.
+                    if (row.value().isTombstone() && job.mayDropTombstones()) {
+                        continue;
+                    }
                 }
 
                 if (writer == null) {

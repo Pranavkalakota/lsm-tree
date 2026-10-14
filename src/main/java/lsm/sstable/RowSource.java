@@ -1,6 +1,7 @@
 package lsm.sstable;
 
 import lsm.memtable.Entry;
+import lsm.memtable.VersionedKey;
 
 import java.io.IOException;
 import java.util.Iterator;
@@ -31,6 +32,41 @@ public interface RowSource {
      * <p>The caller owns the ordering guarantee: a merge assumes every source
      * ascends, and a source that does not will silently produce wrong results
      * rather than fail.
+     */
+    static RowSource ofVersioned(Iterator<Map.Entry<VersionedKey, Entry>> entries) {
+        return new RowSource() {
+            private SSTableReader.Row current = pull();
+
+            private SSTableReader.Row pull() {
+                if (!entries.hasNext()) {
+                    return null;
+                }
+                Map.Entry<VersionedKey, Entry> entry = entries.next();
+                return new SSTableReader.Row(entry.getKey(), entry.getValue());
+            }
+
+            @Override
+            public boolean hasNext() {
+                return current != null;
+            }
+
+            @Override
+            public SSTableReader.Row current() {
+                return current;
+            }
+
+            @Override
+            public SSTableReader.Row next() {
+                SSTableReader.Row row = current;
+                current = pull();
+                return row;
+            }
+        };
+    }
+
+    /**
+     * Wraps an already-sorted iterator whose keys carry their versions. A
+     * separate name from {@link #of}, which both erase to the same signature.
      */
     static RowSource of(Iterator<Map.Entry<String, Entry>> entries) {
         return new RowSource() {
