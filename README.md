@@ -16,6 +16,8 @@ StorageEngine (facade)
   |
   |--> WAL (Write-Ahead Log)         <- crash safety
   |--> MemTable (in-memory sorted map)
+  |                                     every write stamped with a version,
+  |                                     so a snapshot can read the past
   |
   |  (when MemTable exceeds size threshold)
   v
@@ -32,6 +34,13 @@ public interface StorageEngine {
     void put(String key, String value);
     Optional<String> get(String key);
     void delete(String key);
+    Stream<Row> scan(String fromInclusive, String toExclusive);
+
+    // Reads at a fixed point in history, unaffected by later writes.
+    Snapshot snapshot();
+    Optional<String> get(String key, Snapshot at);
+    Stream<Row> scan(String fromInclusive, String toExclusive, Snapshot at);
+
     void close();
 }
 ```
@@ -40,9 +49,10 @@ public interface StorageEngine {
 
 - **MemTable** — In-memory sorted structure (skip list) holding recent writes. Tracks size and triggers flush when threshold is exceeded.
 - **Write-Ahead Log (WAL)** — Append-only log ensuring crash safety. Every write hits the WAL before the MemTable, under a configurable durability mode.
-- **SSTable** — Immutable sorted files on disk with a sparse index for efficient lookups.
+- **SSTable** — Immutable sorted files on disk with an index over every block. Records carry the version that wrote them, so one file can hold a key's whole history.
 - **Bloom Filter** — Probabilistic filter per SSTable to skip unnecessary disk reads.
 - **Compaction** — Background merging of SSTables across levels, dropping stale keys and tombstones.
+- **Snapshots (MVCC)** — Every write carries a version, so a reader can pin a point in history and keep reading it while writes continue.
 
 ## Build & Test
 
@@ -54,7 +64,14 @@ mvn test
 
 All tests should pass. They cover crash recovery, truncated and corrupted
 logs, unicode round trips, read precedence across tables, concurrent reads,
-and randomised operation sequences checked against a reference map.
+snapshot isolation against a model of the store, which versions survive a
+compaction, recovery under a real SIGKILL, and randomised operation sequences
+checked against a reference map.
+
+Most of the count is generated rather than written: around 300 hand-written
+cases, plus 30 property tests that expand into roughly 1,100 between them. Each
+generated case names its seed in its display name, so a failure identifies the
+exact dataset that produced it and can be replayed on its own.
 
 ## Try It
 
@@ -101,6 +118,13 @@ watch; the engine's real default is four megabytes.
 | Leveled compaction | Done |
 | Bloom filters | Done |
 | Write and read benchmarks | Done |
+| Range scans | Done |
+| Sharded write path | Done |
+| Block compression (LZ4) | Done |
+| Idle compaction | Done |
+| Crash injection testing | Done |
+| Snapshots / MVCC | Done |
+| TCP server | Not built |
 
 ## Write Throughput
 
@@ -230,7 +254,75 @@ saved I/O costs. The cache holds blocks already decompressed, so a cache hit
 pays nothing either way; this comparison uses a cache small enough to miss
 every time, which is the case where compression could have hurt.
 
+## Snapshots
+
+A reader can pin a point in the store's history and keep returning to it while
+writes carry on:
+
+```java
+try (Snapshot at = engine.snapshot()) {
+    engine.put("k", "changed");
+    engine.get("k", at);    // the value as of the snapshot
+    engine.get("k");        // "changed"
+}
+```
+
+Every write carries a version from one counter, and a snapshot is nothing more
+than a version number: a read at V sees the newest version of each key written
+at or before it. A key overwritten a thousand times since still reads as it
+did, and a key deleted since still has its value.
+
+**The ordering is what makes this cheap.** Records sort by key ascending but
+version *descending* — in the skip list and in every SSTable alike. "The newest
+version of this key at or before V" is then a single seek to `(key, V)`,
+because the first record at or after that point is already the answer. Ordering
+versions the other way round would make the same read walk a key's whole
+history.
+
+**The block index carries versions too, and has to.** A hot key can hold more
+history than fits in a 4KB block, so a block boundary can land in the middle of
+one key's versions, and several blocks then share a first key. Searching the
+index on the key alone finds the *last* of those blocks and returns an old
+version while the current one sits in an earlier block — a silent wrong answer.
+With versions in the index a lookup reads at most two blocks and never more,
+because the next block already starts after the seek position.
+
+**What a snapshot costs is space, not time.** Reads are no slower, but
+compaction may not discard any version an open snapshot could still reach, so
+history piles up underneath it. The retention rule is to keep every version
+above the oldest open snapshot, plus the newest version at or below it — that
+last one being what a reader holding the oldest snapshot lands on. With nothing
+open the rule collapses to keeping only the current value, which is exactly
+what the store did before any of this existed.
+
+Versioning has a standing cost of its own: an overwrite now appends a record
+rather than replacing one, so the same workload fills the MemTable sooner and
+flushes more often.
+
+**Taking a snapshot briefly blocks writers.** A version is handed out and
+applied under one shard's lock, so `snapshot()` takes every shard lock for an
+instant, and holding them all is what proves every version issued so far has
+landed. Without it a snapshot could name version 7 while version 6 was still in
+flight, and a reader would see a moment the store never passed through.
+Snapshots are rare next to writes, so that is the cheap side of the trade.
+
+It says nothing about durability, though. The fsync happens outside the write
+lock, so a snapshot can include a write that is visible but not yet committed
+to disk. For a reader that is the right answer — the store it is reading
+acknowledged that write.
+
+**Not measured yet:** what any of this costs. The benchmark covers writes,
+reads, compression and bloom filters, but has no snapshot section, so there is
+no figure here for a snapshot read or for the space a held snapshot retains.
+
 ## Design Notes
+
+**Versions are global, not per shard.** One counter issues them, so versions
+compare across shards even though shards never coordinate on anything else.
+On open it resumes above every version on disk, read from table metadata rather
+than by scanning data blocks. A counter that restarted would hand a new write a
+version an old record already used, and the new value would then lose on any
+version-ordered read — a write that silently reverts.
 
 **Tables are immutable.** That one property does most of the work: a block's
 bytes can never change, so the cache needs no invalidation protocol, and a
@@ -252,10 +344,15 @@ key's bytes are still in the file afterwards.
 
 ## Roadmap
 
-- **Sharded write path** — a single lock currently caps buffered throughput
-- **Idle compaction** — deletes are only reclaimed under write pressure, so an
-  idle store keeps tombstones sitting in a level 0 that never hit its trigger
-- **Cold read benchmark** — current read figures have the whole dataset cached
+- **TCP server** — the store is a library; nothing speaks to it over a socket
+- **Snapshot benchmarks** — snapshot reads and the space a held snapshot costs
+  are both unmeasured
+- **A genuinely cold read** — the files stay in the page cache throughout, so
+  no measurement here has ever paid for a disk seek. It needs a dataset larger
+  than RAM
+- **Power-loss testing** — SIGKILL leaves the page cache intact, so the
+  buffered mode legitimately loses nothing under it. Testing the real guarantee
+  needs hardware
 
 ## Tech Stack
 
@@ -263,5 +360,8 @@ key's bytes are still in the file afterwards.
 - Maven
 - JUnit 5
 - Caffeine (block cache)
-- Guava (Bloom filters)
-- JMH (benchmarking)
+- Guava (bloom filters)
+- lz4-java (block compression)
+
+Benchmarking is a plain committed harness (`lsm.Benchmark`) rather than JMH,
+which was enough to find the measurement mistakes noted above.
