@@ -31,6 +31,7 @@ import java.util.Spliterators;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -128,6 +129,15 @@ public class LSMStoreEngine implements StorageEngine {
     private final AtomicLong nextVersion = new AtomicLong(1);
 
     /**
+     * Open snapshots, counted by the version they read at. Sorted, so the
+     * oldest live version — the one compaction must not discard past — is the
+     * first key. Several readers can share a version, hence the count rather
+     * than a set.
+     */
+    private final ConcurrentSkipListMap<Long, Integer> openSnapshots =
+            new ConcurrentSkipListMap<>();
+
+    /**
      * When the last write landed. Compaction leaves a busy store alone and
      * only reclaims below its trigger once writing has stopped, so this is
      * the clock it checks.
@@ -221,7 +231,8 @@ public class LSMStoreEngine implements StorageEngine {
                 nextVersion.updateAndGet(current -> Math.max(current, table.maxVersion() + 1));
             }
 
-            this.compactor = new Compactor(dataDir, blockCache, nextSequence::getAndIncrement);
+            this.compactor = new Compactor(dataDir, blockCache,
+                    nextSequence::getAndIncrement, this::oldestSnapshotVersion);
             this.compactionThread = Executors.newSingleThreadExecutor(runnable -> {
                 Thread thread = new Thread(runnable, "lsm-compaction");
                 thread.setDaemon(true);
@@ -383,6 +394,52 @@ public class LSMStoreEngine implements StorageEngine {
         return Optional.empty();
     }
 
+    @Override
+    public Optional<String> get(String key, Snapshot at) {
+        checkNotClosed();
+        if (key == null) throw new IllegalArgumentException("key must not be null");
+        long version = versionOf(at);
+
+        Entry entry = shardFor(key).memTable.get(key, version);
+        if (entry != null) {
+            return entry.isTombstone() ? Optional.empty() : entry.value();
+        }
+
+        // A table holding only versions newer than the snapshot answers
+        // nothing for this key, so the search carries on into older tables
+        // rather than stopping at the first table that mentions it.
+        for (SSTableReader table : tables.get()) {
+            if (!couldHold(table, key) || !table.acquire()) {
+                continue;
+            }
+            try {
+                Entry found = table.get(key, version);
+                if (found != null) {
+                    return found.isTombstone() ? Optional.empty() : found.value();
+                }
+            } catch (IOException e) {
+                throw new UncheckedIOException("Read failed", e);
+            } finally {
+                table.release();
+            }
+        }
+
+        return Optional.empty();
+    }
+
+    private static long versionOf(Snapshot at) {
+        if (at == null) {
+            throw new IllegalArgumentException("snapshot must not be null");
+        }
+        if (!at.isOpen()) {
+            // Answering anyway would read at a version whose history the store
+            // may already have reclaimed, giving a wrong answer rather than an
+            // error. Better to say so.
+            throw new IllegalStateException("Snapshot is closed: " + at);
+        }
+        return at.version();
+    }
+
     /** Cheap range check that skips opening a block for a key the table cannot have. */
     private static boolean couldHold(SSTableReader table, String key) {
         String min = table.minKey();
@@ -406,6 +463,22 @@ public class LSMStoreEngine implements StorageEngine {
      */
     @Override
     public Stream<Row> scan(String fromInclusive, String toExclusive) {
+        return scan(fromInclusive, toExclusive, VersionedKey.NEWEST);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Rows newer than the snapshot are stepped over before anything else
+     * looks at them, so they cannot settle a key and hide the older version
+     * the reader is entitled to.
+     */
+    @Override
+    public Stream<Row> scan(String fromInclusive, String toExclusive, Snapshot at) {
+        return scan(fromInclusive, toExclusive, versionOf(at));
+    }
+
+    private Stream<Row> scan(String fromInclusive, String toExclusive, long snapshot) {
         checkNotClosed();
         if (fromInclusive != null && toExclusive != null
                 && fromInclusive.compareTo(toExclusive) > 0) {
@@ -420,7 +493,7 @@ public class LSMStoreEngine implements StorageEngine {
         TreeMap<VersionedKey, Entry> buffered = new TreeMap<>();
         for (Shard shard : shards) {
             buffered.putAll(shard.memTable.versionedRange(
-                    fromInclusive, toExclusive, VersionedKey.NEWEST));
+                    fromInclusive, toExclusive, snapshot));
         }
 
         List<SSTableReader> held = new ArrayList<>();
@@ -444,7 +517,8 @@ public class LSMStoreEngine implements StorageEngine {
 
         MergingCursor merged = new MergingCursor(sources);
         return StreamSupport.stream(Spliterators.spliteratorUnknownSize(
-                        rows(merged, toExclusive), Spliterator.ORDERED | Spliterator.SORTED), false)
+                        rows(merged, toExclusive, snapshot),
+                        Spliterator.ORDERED | Spliterator.SORTED), false)
                 // Each table stays alive until the scan finishes with it, even
                 // if compaction retires it in the meantime.
                 .onClose(() -> {
@@ -454,7 +528,7 @@ public class LSMStoreEngine implements StorageEngine {
     }
 
     /** Drops tombstones and stops at the upper bound; keys ascend, so it can stop early. */
-    private Iterator<Row> rows(MergingCursor merged, String toExclusive) {
+    private Iterator<Row> rows(MergingCursor merged, String toExclusive, long snapshot) {
         return new Iterator<>() {
             // Declared before pending, whose initializer calls advance() and
             // writes this; the other order would reset it straight afterwards.
@@ -468,6 +542,13 @@ public class LSMStoreEngine implements StorageEngine {
                         SSTableReader.Row row = merged.next();
                         if (toExclusive != null && row.key().compareTo(toExclusive) >= 0) {
                             return null;
+                        }
+                        // Checked before the key is settled, not after: a
+                        // version this reader cannot see must not be the one
+                        // that decides the key, or the visible older version
+                        // below it would be skipped as stale history.
+                        if (row.version() > snapshot) {
+                            continue;
                         }
                         // The merge hands over a key's whole history, newest
                         // first, so the first record settles the key and the
@@ -563,6 +644,66 @@ public class LSMStoreEngine implements StorageEngine {
         } catch (IOException e) {
             throw new UncheckedIOException("Write failed to commit", e);
         }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Every shard lock is taken for the moment this runs. A version is
+     * handed out and applied under one of those locks, so holding them all
+     * means every version issued so far has landed, and the current version is
+     * therefore a point the store genuinely passed through rather than one it
+     * is halfway into. Without that, a snapshot could include version 7 while
+     * version 6 was still in flight, and a reader would see a half-written
+     * moment that never existed.
+     *
+     * <p>Snapshots are rare next to writes, so briefly blocking writers is the
+     * cheap side of that trade.
+     *
+     * <p>Note this says nothing about durability: the fsync happens outside
+     * the write lock, so a snapshot can include a write that is visible but
+     * not yet committed to disk. For a reader that is the right answer — the
+     * write was acknowledged by the store it is reading.
+     */
+    @Override
+    public Snapshot snapshot() {
+        checkNotClosed();
+        for (Shard shard : shards) {
+            shard.lock.lock();
+        }
+        long version;
+        try {
+            checkNotClosed();
+            version = nextVersion.get() - 1;
+            openSnapshots.merge(version, 1, Integer::sum);
+        } finally {
+            for (Shard shard : shards) {
+                shard.lock.unlock();
+            }
+        }
+        return new Snapshot(version, () -> releaseSnapshot(version));
+    }
+
+    private void releaseSnapshot(long version) {
+        openSnapshots.compute(version, (key, count) ->
+                count == null || count <= 1 ? null : count - 1);
+    }
+
+    /**
+     * The oldest version any open snapshot reads at, or {@link Long#MAX_VALUE}
+     * when none is open, which tells compaction nothing has to be preserved.
+     *
+     * <p>Safe to read without coordinating with an in-flight compaction, which
+     * samples this once and keeps working from that value. A snapshot opened
+     * mid-merge always reads at the current version, and a merge keeps the
+     * newest version of every key whatever its watermark, so the newcomer's
+     * answers survive regardless. That argument only holds because snapshots
+     * cannot be opened at an arbitrary past version — if they ever can, this
+     * needs revisiting.
+     */
+    private long oldestSnapshotVersion() {
+        Map.Entry<Long, Integer> oldest = openSnapshots.firstEntry();
+        return oldest == null ? Long.MAX_VALUE : oldest.getKey();
     }
 
     @Override

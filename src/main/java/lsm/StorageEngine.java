@@ -23,6 +23,24 @@ public interface StorageEngine {
      */
     Stream<Row> scan(String fromInclusive, String toExclusive);
 
+    /**
+     * Opens a snapshot at the store's current version.
+     *
+     * <p>Callers must close it. Until they do, compaction cannot discard any
+     * version the snapshot could still read, so an abandoned snapshot stops
+     * the store reclaiming space underneath it.
+     */
+    Snapshot snapshot();
+
+    /** The value of a key as of a snapshot, rather than as of now. */
+    Optional<String> get(String key, Snapshot at);
+
+    /**
+     * A range scan as of a snapshot. The stream must be closed, as with
+     * {@link #scan(String, String)}.
+     */
+    Stream<Row> scan(String fromInclusive, String toExclusive, Snapshot at);
+
     void close();
 
     /** One entry of a scan. */
