@@ -53,6 +53,7 @@ public interface StorageEngine {
 - **Bloom Filter** — Probabilistic filter per SSTable to skip unnecessary disk reads.
 - **Compaction** — Background merging of SSTables across levels, dropping stale keys and tombstones.
 - **Snapshots (MVCC)** — Every write carries a version, so a reader can pin a point in history and keep reading it while writes continue.
+- **TCP server** — A line protocol over sockets, one session per connection, so a client can hold a snapshot across many commands.
 
 ## Build & Test
 
@@ -124,7 +125,7 @@ watch; the engine's real default is four megabytes.
 | Idle compaction | Done |
 | Crash injection testing | Done |
 | Snapshots / MVCC | Done |
-| TCP server | Not built |
+| TCP server with sessions | Done |
 
 ## Write Throughput
 
@@ -315,6 +316,85 @@ acknowledged that write.
 reads, compression and bloom filters, but has no snapshot section, so there is
 no figure here for a snapshot read or for the space a held snapshot retains.
 
+## Serving It Over TCP
+
+The store is a library; this makes it something you can talk to.
+
+```bash
+mvn -q compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+java -cp "target/classes:$(cat target/cp.txt)" lsm.net.StoreServer ./demo-data 7070
+```
+
+It speaks a line protocol, so `telnet` or `nc` is enough to drive it by hand:
+
+```
+$ nc 127.0.0.1 7070
+PUT name ada
+OK
+PUT lang java
+OK
+SNAPSHOT
+OK 2
+PUT name grace
+OK
+GET name
+VALUE ada          <- the snapshot still sees what it saw
+SCAN
+ROW lang java
+ROW name ada
+END
+RELEASE
+OK
+GET name
+VALUE grace        <- and now the current value
+```
+
+| Command | Reply |
+| --- | --- |
+| `PUT <key> <value>` | `OK` |
+| `GET <key>` | `VALUE <value>` or `NIL` |
+| `DEL <key>` | `OK` |
+| `SCAN [from] [to]` | `ROW <key> <value>` per row, then `END`; `-` means an open bound |
+| `SNAPSHOT` | `OK <version>` |
+| `RELEASE` | `OK` |
+| `PING` / `QUIT` | `PONG` / `OK` |
+
+Anything else answers `ERR <reason>` and leaves the connection alone. Asking
+for a missing key or mistyping a command should not cost a client its
+connection, let alone its snapshot.
+
+**Connections are stateful, and that is the point.** A client holds a snapshot
+across many commands and keeps reading the same moment, which is the thing a
+request-per-connection protocol cannot offer. Note from the transcript above
+that `SNAPSHOT` is not a transaction: the `PUT` that follows it lands for
+everyone immediately, including for the very connection that cannot then see
+it. It buys a consistent view to read, not a unit of work to commit.
+
+**A session is closed on every way out of a connection** — an orderly `QUIT`,
+a client that vanishes, a broken pipe, or the server shutting down with
+connections still open. That is not politeness. An open snapshot stops
+compaction reclaiming any version beneath it, so a connection that died
+holding one would pin that history for as long as the process lives, and
+nothing about the leak would be visible: every read keeps returning the right
+answer, the space simply never comes back. The socket, the session and the
+streams open in one try-with-resources so there is no path out that skips the
+cleanup, and the tests check it by counting versions on disk rather than by
+asking the store anything.
+
+Two things the server protects itself from. Connections past the limit are
+told `ERR server at capacity` and closed, rather than queued behind a bounded
+thread pool, which would accept them and leave them unserved — indistinguishable
+from a hang. And the line reader is hand-rolled with a 64KB bound, because
+`BufferedReader.readLine` has none and a client that never sends a newline
+would otherwise make the server buffer until it died.
+
+**What the protocol cannot carry.** It is line based, so a key cannot contain
+a space and neither a key nor a value can contain a newline. The engine itself
+stores both perfectly well — the property tests push emoji and CJK text
+through it — so the server is the narrower of the two. Length-prefixed framing
+would fix it and would also mean you could no longer drive the thing from
+`nc`, which did not seem the right trade for the demo.
+
 ## Design Notes
 
 **Versions are global, not per shard.** One counter issues them, so versions
@@ -344,7 +424,6 @@ key's bytes are still in the file afterwards.
 
 ## Roadmap
 
-- **TCP server** — the store is a library; nothing speaks to it over a socket
 - **Snapshot benchmarks** — snapshot reads and the space a held snapshot costs
   are both unmeasured
 - **A genuinely cold read** — the files stay in the page cache throughout, so
