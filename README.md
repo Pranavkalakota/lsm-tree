@@ -312,9 +312,49 @@ lock, so a snapshot can include a write that is visible but not yet committed
 to disk. For a reader that is the right answer — the store it is reading
 acknowledged that write.
 
-**Not measured yet:** what any of this costs. The benchmark covers writes,
-reads, compression and bloom filters, but has no snapshot section, so there is
-no figure here for a snapshot read or for the space a held snapshot retains.
+### What a snapshot costs
+
+Measured, because the shape of the cost is not the obvious one.
+
+| Lookup | reads/sec | p50 | p99 |
+| --- | ---: | ---: | ---: |
+| Current value | 4,683,000 | 0.21us | 0.46us |
+| Through a snapshot | 5,192,000 | 0.17us | 0.46us |
+| Current value again | 4,908,000 | 0.21us | 0.46us |
+| Snapshot, 3 versions newer on top | 1,101,000 | 0.83us | 3.46us |
+
+**Reading through a snapshot is free.** It runs the same code as reading now —
+`get(key)` delegates to `get(key, NEWEST)` — so there is nothing there to cost
+anything, and the measurement agrees: the two land within the 5% the baseline
+moved between its own two runs. The baseline is measured twice for exactly
+that reason, so the noise is visible rather than being reported as a result.
+
+**Reading an old version is not free: 4.35x.** Once three newer versions sit
+on top of the one a snapshot wants, the lookup has to step over them to reach
+it. This is the cost of the descending-version layout, and it is the right way
+round — the current value, which almost every read wants, stays a single seek,
+and the reader who asked for the past pays for it.
+
+**Holding a snapshot costs space, and this is the number that matters:**
+
+| 200,000 overwrites of one key | Bytes on disk | Versions kept |
+| --- | ---: | ---: |
+| No snapshot open | 21,085 | 1 |
+| Snapshot held throughout | 2,059,673 | 199,684 |
+
+**97.7x.** With nothing open, compaction collapses the key to its current
+value and the store is 21KB. With one snapshot held from the start, not a
+single version may be discarded, and the same workload leaves 2MB behind. That
+is the whole tradeoff in one table: a snapshot buys a stable view of the past
+by forbidding the store from forgetting it.
+
+This also measures itself honestly — it waits for compaction to stop changing
+the answer rather than sleeping a fixed amount, because whether the machine
+happened to finish inside a sleep should not decide the headline figure.
+
+**Taking a snapshot costs 1.29us median, 6.21us p99.** It waits for all eight
+shard locks, which is what makes the version it names a moment the store
+actually passed through rather than one it was halfway into.
 
 ## Serving It Over TCP
 
@@ -424,8 +464,6 @@ key's bytes are still in the file afterwards.
 
 ## Roadmap
 
-- **Snapshot benchmarks** — snapshot reads and the space a held snapshot costs
-  are both unmeasured
 - **A genuinely cold read** — the files stay in the page cache throughout, so
   no measurement here has ever paid for a disk seek. It needs a dataset larger
   than RAM
