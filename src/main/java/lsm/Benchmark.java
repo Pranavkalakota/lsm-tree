@@ -56,6 +56,10 @@ public final class Benchmark {
             Integer.getInteger("bench.compression.keys", 50_000);
 
     private static final int READ_KEYS = Integer.getInteger("bench.read.keys", 100_000);
+
+    /** Overwrites piled on one key to build history under a held snapshot. */
+    private static final int SNAPSHOT_CHURN =
+            Integer.getInteger("bench.snapshot.churn", 200_000);
     private static final int READ_OPS = Integer.getInteger("bench.read.ops", 100_000);
 
     /** Negative means let the engine pick, which depends on durability mode. */
@@ -80,6 +84,7 @@ public final class Benchmark {
         coldReads();
         bloomComparison();
         compression();
+        snapshots();
 
         System.out.println("""
 
@@ -471,6 +476,234 @@ public final class Benchmark {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    /**
+     * What a snapshot costs: nothing much to read through, and space to hold.
+     *
+     * <p>Worth measuring rather than asserting, because the shape of the cost
+     * is not obvious. A snapshot read is a seek to {@code (key, version)}
+     * instead of to the newest version, which should be the same work; the
+     * part that is genuinely expensive is that compaction may not discard
+     * anything an open snapshot could still reach.
+     */
+    private static void snapshots() throws Exception {
+        snapshotReadCost();
+        snapshotSpaceCost();
+        snapshotCreationCost();
+    }
+
+    /** Reading now, versus reading through a snapshot with history beneath it. */
+    private static void snapshotReadCost() throws Exception {
+        System.out.printf("%n%,d keys, reading through a snapshot%n%n", READ_KEYS);
+        System.out.printf("%-28s %12s   %10s   %10s%n",
+                "lookup", "reads/sec", "p50", "p99");
+        System.out.println("-".repeat(68));
+
+        delete(DIR);
+        LSMStoreEngine engine = new LSMStoreEngine(DIR, 4L * 1024 * 1024);
+        try {
+            for (int i = 0; i < READ_KEYS; i++) {
+                engine.put(key(i), "value_" + i);
+            }
+            Thread.sleep(3_000);
+
+            String[] keys = new String[READ_OPS];
+            for (int i = 0; i < READ_OPS; i++) {
+                keys[i] = key(i % READ_KEYS);
+            }
+
+            // Warmed before anything is timed. The first sample otherwise
+            // pays for cold blocks and makes whatever runs second look
+            // faster, which is how a snapshot read can appear to beat a
+            // plain one.
+            for (int round = 0; round < 3; round++) {
+                for (String k : keys) {
+                    engine.get(k);
+                }
+            }
+
+            double first = sample("current value", i -> engine.get(keys[i]));
+
+            double atSnapshot;
+            try (Snapshot fresh = engine.snapshot()) {
+                atSnapshot = sample("through a snapshot", i -> engine.get(keys[i], fresh));
+            }
+
+            // The baseline again, after the snapshot run, so any drift over
+            // the course of the measurement is visible rather than hidden.
+            double second = sample("current value again", i -> engine.get(keys[i]));
+            double current = (first + second) / 2;
+
+            // Now with every key overwritten underneath the snapshot, so the
+            // version it wants is no longer the first one a lookup meets.
+            double buried;
+            try (Snapshot held = engine.snapshot()) {
+                for (int round = 0; round < 3; round++) {
+                    for (int i = 0; i < READ_KEYS; i++) {
+                        engine.put(key(i), "rewritten_" + round + "_" + i);
+                    }
+                }
+                Thread.sleep(3_000);
+                for (String k : keys) {
+                    engine.get(k, held);
+                }
+                buried = sample("snapshot, 3 versions newer", i -> engine.get(keys[i], held));
+            }
+
+            // Reported as a ratio and nothing more. Reading at a snapshot
+            // runs the same code as reading now -- get(key) delegates to
+            // get(key, NEWEST) -- so there is no cost here to find, and the
+            // baseline is measured twice to show how much the number moves
+            // on its own. Either side of 1.00 is noise, not a result.
+            double spread = Math.max(first, second) / Math.min(first, second) - 1;
+            System.out.printf("%nsnapshot read vs current read: %.2fx, against %.0f%% "
+                            + "drift in the baseline itself -- the same seek either way%n",
+                    current / atSnapshot, spread * 100);
+            System.out.printf("reading a version three overwrites old: %.2fx, "
+                            + "which is the real cost%n", current / buried);
+        } finally {
+            engine.close();
+        }
+        delete(DIR);
+    }
+
+    /**
+     * The real cost: history a held snapshot will not let compaction discard.
+     *
+     * <p>The same workload runs twice, once with a snapshot open throughout
+     * and once without, and the store is measured after compaction settles.
+     */
+    private static void snapshotSpaceCost() throws Exception {
+        System.out.printf("%n%,d overwrites of one key, measured after compaction%n%n",
+                SNAPSHOT_CHURN);
+        System.out.printf("%-28s %14s %14s%n", "", "bytes on disk", "versions kept");
+        System.out.println("-".repeat(60));
+
+        long free = churnAndMeasure(false);
+        long held = churnAndMeasure(true);
+
+        System.out.printf("%na held snapshot kept %.1fx the bytes of the same "
+                        + "workload with none open%n", (double) held / Math.max(free, 1));
+    }
+
+    /** Runs the churn with or without a snapshot open, returning bytes on disk. */
+    private static long churnAndMeasure(boolean holdSnapshot) throws Exception {
+        delete(DIR);
+        // Deliberately small. The point is what survives on DISK, and a
+        // MemTable large enough to hold the whole churn would flush nothing,
+        // leaving both runs measuring an empty directory.
+        LSMStoreEngine engine = new LSMStoreEngine(DIR, 64L * 1024);
+        Snapshot snapshot = null;
+        try {
+            engine.put("hot", "first");
+            if (holdSnapshot) {
+                snapshot = engine.snapshot();
+            }
+            for (int i = 0; i < SNAPSHOT_CHURN; i++) {
+                engine.put("hot", "value_" + i);
+            }
+            // Compaction is what collapses history, so this waits for it to
+            // stop changing the answer rather than sleeping a fixed amount.
+            // A fixed sleep makes the headline number depend on whether the
+            // machine happened to finish in time.
+            long versions = awaitSettled();
+            long bytes = storeBytes(DIR);
+            System.out.printf("%-28s %,14d %,14d%n",
+                    holdSnapshot ? "snapshot held throughout" : "no snapshot open",
+                    bytes, versions);
+            return bytes;
+        } finally {
+            if (snapshot != null) {
+                snapshot.close();
+            }
+            engine.close();
+            delete(DIR);
+        }
+    }
+
+    /**
+     * Waits for compaction to stop changing how much history is stored,
+     * returning the figure it settled on.
+     */
+    private static long awaitSettled() throws Exception {
+        long previous = -1;
+        long stableFor = 0;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+        while (System.nanoTime() < deadline) {
+            Thread.sleep(500);
+            long current = versionsOf(DIR, "hot");
+            stableFor = current == previous ? stableFor + 1 : 0;
+            previous = current;
+            if (stableFor >= 3) {
+                return current;
+            }
+        }
+        return previous;
+    }
+
+    /** How long taking a snapshot blocks, given it waits for every shard lock. */
+    private static void snapshotCreationCost() throws Exception {
+        delete(DIR);
+        LSMStoreEngine engine = new LSMStoreEngine(DIR, 64L * 1024 * 1024,
+                DurabilityMode.BUFFERED, 8);
+        try {
+            for (int i = 0; i < 1_000; i++) {
+                engine.put(key(i), "value_" + i);
+            }
+
+            int samples = 2_000;
+            long[] nanos = new long[samples];
+            for (int i = 0; i < samples; i++) {
+                long start = System.nanoTime();
+                engine.snapshot().close();
+                nanos[i] = System.nanoTime() - start;
+            }
+            Arrays.sort(nanos);
+
+            System.out.printf("%ntaking a snapshot: %.2fus median, %.2fus p99 "
+                            + "(it waits for all 8 shard locks)%n",
+                    nanos[samples / 2] / 1e3, nanos[(int) (samples * 0.99)] / 1e3);
+        } finally {
+            engine.close();
+        }
+        delete(DIR);
+    }
+
+    /** Total size of every table in the store. */
+    private static long storeBytes(Path dir) throws IOException {
+        try (var files = Files.list(dir)) {
+            return files.filter(path -> path.getFileName().toString().endsWith(".sst"))
+                    .mapToLong(path -> {
+                        try {
+                            return Files.size(path);
+                        } catch (IOException e) {
+                            return 0;
+                        }
+                    }).sum();
+        }
+    }
+
+    /** How many versions of one key survive across every table. */
+    private static long versionsOf(Path dir, String key) throws IOException {
+        List<Path> tables;
+        try (var files = Files.list(dir)) {
+            tables = files.filter(p -> p.getFileName().toString().endsWith(".sst")).toList();
+        }
+        long found = 0;
+        for (Path path : tables) {
+            try (SSTableReader reader = new SSTableReader(path, new BlockCache(1 << 16))) {
+                SSTableReader.Cursor cursor = reader.cursor();
+                while (cursor.hasNext()) {
+                    if (cursor.next().key().equals(key)) {
+                        found++;
+                    }
+                }
+            } catch (IOException e) {
+                // Retired mid-walk by compaction; its rows live elsewhere now.
+            }
+        }
+        return found;
     }
 
     private static void delete(Path dir) throws IOException {
