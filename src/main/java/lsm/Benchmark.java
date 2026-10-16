@@ -1,13 +1,22 @@
 package lsm;
 
 import lsm.memtable.Entry;
+import lsm.net.StoreServer;
 import lsm.sstable.BlockCache;
 import lsm.sstable.CompressionType;
 import lsm.sstable.SSTableReader;
 import lsm.sstable.SSTableWriter;
 import lsm.wal.DurabilityMode;
 
+import java.io.BufferedReader;
+import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.io.UncheckedIOException;
+import java.io.Writer;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Optional;
 import java.util.TreeMap;
@@ -68,6 +77,10 @@ public final class Benchmark {
      */
     private static final int COLD_GB = Integer.getInteger("bench.cold.gb", 0);
 
+    /** Requests sent before reading any reply, when measuring pipelining. */
+    private static final int PIPELINE_DEPTH =
+            Integer.getInteger("bench.pipeline", 32);
+
     /** Overwrites piled on one key to build history under a held snapshot. */
     private static final int SNAPSHOT_CHURN =
             Integer.getInteger("bench.snapshot.churn", 200_000);
@@ -96,6 +109,7 @@ public final class Benchmark {
         bloomComparison();
         compression();
         snapshots();
+        server();
         trulyColdReads();
 
         System.out.println("""
@@ -760,6 +774,198 @@ public final class Benchmark {
             engine.close();
         }
         delete(DIR);
+    }
+
+    /** Total size of every table in the store. */
+    private static final class BenchClient implements Closeable {
+        private final Socket socket;
+        private final BufferedReader in;
+        private final Writer out;
+
+        BenchClient(int port) throws IOException {
+            socket = new Socket("127.0.0.1", port);
+            // Without this a request-response protocol waits on Nagle's
+            // algorithm to decide a small write is worth sending.
+            socket.setTcpNoDelay(true);
+            socket.setSoTimeout(30_000);
+            in = new BufferedReader(new InputStreamReader(
+                    socket.getInputStream(), StandardCharsets.UTF_8));
+            out = new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8);
+        }
+
+        String command(String line) throws IOException {
+            send(line);
+            out.flush();
+            return in.readLine();
+        }
+
+        void send(String line) throws IOException {
+            out.write(line);
+            out.write('\n');
+        }
+
+        void flush() throws IOException {
+            out.flush();
+        }
+
+        String read() throws IOException {
+            return in.readLine();
+        }
+
+        @Override
+        public void close() throws IOException {
+            socket.close();
+        }
+    }
+
+    /**
+     * What the network costs, which is the only thing this section measures.
+     *
+     * <p>Every other figure in this harness is an in-process call. A server
+     * puts a socket, a line protocol and a round trip in front of the same
+     * engine, and the interesting question is how much of the result is then
+     * the store at all.
+     */
+    private static void server() throws Exception {
+        delete(DIR);
+        LSMStoreEngine engine = new LSMStoreEngine(DIR, MEMTABLE);
+        StoreServer server = null;
+        try {
+            for (int i = 0; i < READ_KEYS; i++) {
+                engine.put(key(i), "value_" + i);
+            }
+            Thread.sleep(2_000);
+
+            server = new StoreServer(engine, 0);
+            String[] gets = new String[READ_OPS];
+            for (int i = 0; i < READ_OPS; i++) {
+                gets[i] = "GET " + key(i % READ_KEYS);
+            }
+
+            System.out.printf("%n%,d keys, served over loopback%n%n", READ_KEYS);
+            System.out.printf("%-28s %12s   %10s   %10s%n",
+                    "request", "ops/sec", "p50", "p99");
+            System.out.println("-".repeat(68));
+
+            double inProcess = sample("in process, no socket",
+                    i -> engine.get(key(i % READ_KEYS)));
+
+            double overTcp;
+            try (BenchClient client = new BenchClient(server.port())) {
+                overTcp = sample("GET over tcp", i -> {
+                    try {
+                        client.command(gets[i]);
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                });
+                sample("PUT over tcp", i -> {
+                    try {
+                        client.command("PUT bench_" + i + " value");
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                });
+            }
+
+            double pipelined = pipelinedReads(server.port(), gets);
+            System.out.printf("%na round trip costs %.0fx an in-process call; "
+                            + "pipelining %d deep wins %.1fx of it back%n",
+                    inProcess / overTcp, PIPELINE_DEPTH, pipelined / overTcp);
+
+            concurrentClients(server.port(), gets);
+        } finally {
+            if (server != null) {
+                server.close();
+            }
+            engine.close();
+        }
+        delete(DIR);
+    }
+
+    /**
+     * The same reads with several in flight at once.
+     *
+     * <p>A request-response client spends most of its time waiting for the
+     * wire rather than for the store, so this separates the two: if filling
+     * the pipe makes it much faster, the round trip was the bottleneck.
+     */
+    private static double pipelinedReads(int port, String[] gets) throws Exception {
+        try (BenchClient client = new BenchClient(port)) {
+            int batches = READ_OPS / PIPELINE_DEPTH;
+            for (int warm = 0; warm < batches / 10; warm++) {
+                runBatch(client, gets, warm);
+            }
+
+            long start = System.nanoTime();
+            for (int batch = 0; batch < batches; batch++) {
+                runBatch(client, gets, batch);
+            }
+            long nanos = System.nanoTime() - start;
+
+            double rate = (batches * (double) PIPELINE_DEPTH) / (nanos / 1e9);
+            System.out.printf("%-28s %,12.0f   %10s   %10s%n",
+                    "GET pipelined x" + PIPELINE_DEPTH, rate, "-", "-");
+            return rate;
+        }
+    }
+
+    private static void runBatch(BenchClient client, String[] gets, int batch)
+            throws IOException {
+        for (int i = 0; i < PIPELINE_DEPTH; i++) {
+            client.send(gets[(batch * PIPELINE_DEPTH + i) % gets.length]);
+        }
+        client.flush();
+        for (int i = 0; i < PIPELINE_DEPTH; i++) {
+            client.read();
+        }
+    }
+
+    /** Throughput as clients are added, each on its own connection. */
+    private static void concurrentClients(int port, String[] gets) throws Exception {
+        System.out.printf("%n%-28s %12s%n", "concurrent clients", "ops/sec");
+        System.out.println("-".repeat(44));
+        for (int clients : new int[] {1, 2, 4, 8, 16}) {
+            System.out.printf("%-28d %,12.0f%n", clients,
+                    clientThroughput(port, gets, clients));
+        }
+    }
+
+    private static double clientThroughput(int port, String[] gets, int clients)
+            throws Exception {
+        int per = Math.max(READ_OPS / clients, 1);
+        ExecutorService pool = Executors.newFixedThreadPool(clients);
+        CountDownLatch ready = new CountDownLatch(clients);
+        CountDownLatch gate = new CountDownLatch(1);
+
+        try {
+            List<Future<?>> futures = new ArrayList<>();
+            for (int c = 0; c < clients; c++) {
+                futures.add(pool.submit(() -> {
+                    try (BenchClient client = new BenchClient(port)) {
+                        for (int i = 0; i < per / 10; i++) {
+                            client.command(gets[i % gets.length]);
+                        }
+                        ready.countDown();
+                        gate.await();
+                        for (int i = 0; i < per; i++) {
+                            client.command(gets[i % gets.length]);
+                        }
+                    }
+                    return null;
+                }));
+            }
+            ready.await();
+            long start = System.nanoTime();
+            gate.countDown();
+            for (Future<?> future : futures) {
+                future.get();
+            }
+            long nanos = System.nanoTime() - start;
+            return (clients * (double) per) / (nanos / 1e9);
+        } finally {
+            pool.shutdownNow();
+        }
     }
 
     /** Total size of every table in the store. */
