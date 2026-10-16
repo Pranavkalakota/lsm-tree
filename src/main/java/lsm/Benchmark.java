@@ -57,6 +57,17 @@ public final class Benchmark {
 
     private static final int READ_KEYS = Integer.getInteger("bench.read.keys", 100_000);
 
+    /**
+     * Gigabytes to write before the cold read measurement, or 0 to skip it.
+     *
+     * <p>Off by default because it is the one measurement here that cannot be
+     * taken cheaply: every other number in this harness comes from data the
+     * page cache is holding, and the only ways past that are a dataset larger
+     * than memory or a privileged cache drop. Both are the operator's call,
+     * not something a benchmark should do unasked.
+     */
+    private static final int COLD_GB = Integer.getInteger("bench.cold.gb", 0);
+
     /** Overwrites piled on one key to build history under a held snapshot. */
     private static final int SNAPSHOT_CHURN =
             Integer.getInteger("bench.snapshot.churn", 200_000);
@@ -85,6 +96,7 @@ public final class Benchmark {
         bloomComparison();
         compression();
         snapshots();
+        trulyColdReads();
 
         System.out.println("""
 
@@ -664,6 +676,86 @@ public final class Benchmark {
             System.out.printf("%ntaking a snapshot: %.2fus median, %.2fus p99 "
                             + "(it waits for all 8 shard locks)%n",
                     nanos[samples / 2] / 1e3, nanos[(int) (samples * 0.99)] / 1e3);
+        } finally {
+            engine.close();
+        }
+        delete(DIR);
+    }
+
+    /**
+     * Reads that genuinely touch the disk, rather than the page cache.
+     *
+     * <p>Every other read figure in this harness is a memory-speed number
+     * wearing a storage-engine label: the files are small enough to sit in
+     * the operating system's cache throughout, so the reads pay for block
+     * lookup, checksum and decompression but never for a seek. The only
+     * honest ways around that are to write more data than the machine has
+     * memory, or to drop the cache, which needs privileges this process does
+     * not have and should not ask for.
+     *
+     * <p>So this runs only when asked: {@code -Dbench.cold.gb=32} on a
+     * machine with less memory than that. The alternative, if you would
+     * rather not write tens of gigabytes, is to drop the cache by hand
+     * between the write and the read -- {@code sudo purge} on macOS,
+     * {@code echo 3 | sudo tee /proc/sys/vm/drop_caches} on Linux -- which
+     * the README spells out.
+     */
+    private static void trulyColdReads() throws Exception {
+        if (COLD_GB <= 0) {
+            long ram = Runtime.getRuntime().maxMemory();
+            System.out.printf("%ncold reads against the disk: skipped. Every read "
+                    + "figure above is served from the page cache.%n"
+                    + "Run -Dbench.cold.gb=N with N above the machine's RAM to "
+                    + "measure one, or see the README for the purge recipe.%n"
+                    + "(this JVM's heap ceiling is %,d MB; the machine's RAM is "
+                    + "what matters)%n", ram / (1024 * 1024));
+            return;
+        }
+
+        long target = COLD_GB * 1024L * 1024L * 1024L;
+        System.out.printf("%nwriting %,d GB so the dataset outgrows the page cache%n",
+                COLD_GB);
+
+        delete(DIR);
+        LSMStoreEngine engine = new LSMStoreEngine(DIR, 64L * 1024 * 1024);
+        try {
+            // Incompressible on purpose. Repetitive padding compresses by
+            // better than 85%, so a run using it would write gigabytes and
+            // still leave a store small enough to sit entirely in the cache,
+            // measuring exactly the thing this is trying to avoid. Slices of
+            // one random pool give every value different content at no
+            // per-value cost.
+            java.util.Random filler = new java.util.Random(7);
+            char[] pool = new char[1 << 20];
+            for (int i = 0; i < pool.length; i++) {
+                pool[i] = (char) (0x21 + filler.nextInt(94));
+            }
+            int valueSize = 900;
+
+            int written = 0;
+            long onDisk = 0;
+            while (onDisk < target) {
+                for (int i = 0; i < 200_000; i++) {
+                    int offset = (written * 907) % (pool.length - valueSize);
+                    engine.put(key(written++), new String(pool, offset, valueSize));
+                }
+                onDisk = storeBytes(DIR);
+                System.out.printf("  %,d keys, %,d MB on disk%n", written,
+                        onDisk / (1024 * 1024));
+            }
+
+            // Reads scattered across the whole range, so the page cache
+            // cannot hold the working set however large it is.
+            java.util.Random random = new java.util.Random(42);
+            String[] keys = new String[READ_OPS];
+            for (int i = 0; i < READ_OPS; i++) {
+                keys[i] = key(random.nextInt(written));
+            }
+
+            System.out.printf("%n%-28s %12s   %10s   %10s%n",
+                    "cold read", "reads/sec", "p50", "p99");
+            System.out.println("-".repeat(68));
+            sample("random, dataset > RAM", i -> engine.get(keys[i]));
         } finally {
             engine.close();
         }

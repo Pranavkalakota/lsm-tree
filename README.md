@@ -66,8 +66,9 @@ mvn test
 All tests should pass. They cover crash recovery, truncated and corrupted
 logs, unicode round trips, read precedence across tables, concurrent reads,
 snapshot isolation against a model of the store, which versions survive a
-compaction, recovery under a real SIGKILL, and randomised operation sequences
-checked against a reference map.
+compaction, recovery under a real SIGKILL, recovery from a log cut at every
+byte offset it has, and randomised operation sequences checked against a
+reference map.
 
 Most of the count is generated rather than written: around 300 hand-written
 cases, plus 30 property tests that expand into roughly 1,100 between them. Each
@@ -195,8 +196,24 @@ working set, throughput halves again and p99 roughly triples.
 
 **What this still does not measure is a cold operating system.** The files stay
 in the page cache throughout, so these reads pay for block lookup, checksum and
-decompression, but not for a disk seek. A number that included one would need a
-dataset larger than RAM.
+decompression, but not for a disk seek.
+
+The harness can measure one, but not for free, so it is off by default:
+
+```bash
+# write more data than the machine has memory, then read it at random
+java -cp "target/classes:$(cat target/cp.txt)" -Dbench.cold.gb=32 lsm.Benchmark
+```
+
+Pick a number above the machine's RAM. The values it writes are slices of a
+random pool rather than repeated padding, because repetitive data compresses
+by over 85% and a run using it would write gigabytes while leaving a store
+small enough to sit in the cache — measuring precisely the thing being avoided.
+
+The cheaper route is to drop the cache by hand between writing and reading,
+which needs privileges the benchmark does not have and should not ask for:
+`sudo purge` on macOS, or `echo 3 | sudo tee /proc/sys/vm/drop_caches` on
+Linux.
 
 ### What the bloom filter is worth
 
@@ -453,6 +470,15 @@ file cursor, the table list is copy-on-write, and the MemTable is a skip
 list. A read-write lock would have been simpler and would have blocked every
 reader behind every write.
 
+**A power cut is not a crash, and the log is tested for both.** Killing the
+process leaves the operating system holding the bytes, so everything written
+still reaches the disk; cutting the power does not, and the log is left ending
+at an arbitrary byte, very possibly mid-record. Recovery is checked against
+every single truncation offset of a generated log, and must return a prefix of
+what was written every time — not an error, not a half-applied record, and
+never a value that was never written. Accepting a partly read value instead of
+rejecting the record fails 24 of those 26 cases.
+
 **Flush ordering carries the crash guarantee.** The table is fsynced and
 renamed before the log is reset, so a crash in the gap leaves the writes
 recoverable from the log. The new table is published before the MemTable is
@@ -464,12 +490,13 @@ key's bytes are still in the file afterwards.
 
 ## Roadmap
 
-- **A genuinely cold read** — the files stay in the page cache throughout, so
-  no measurement here has ever paid for a disk seek. It needs a dataset larger
-  than RAM
-- **Power-loss testing** — SIGKILL leaves the page cache intact, so the
-  buffered mode legitimately loses nothing under it. Testing the real guarantee
-  needs hardware
+- **A genuinely cold read** — the harness will measure one with
+  `-Dbench.cold.gb=N` above the machine's RAM, but no such run is recorded
+  here, so every read figure above is a page-cache figure
+- **Proof that the drive honours `fsync`** — the test suite simulates the half
+  of a power cut that software can reproduce. Whether an SSD really commits on
+  `fsync`, rather than parking bytes in its own volatile buffer and reporting
+  success, can only be settled by unplugging a machine
 
 ## Tech Stack
 
