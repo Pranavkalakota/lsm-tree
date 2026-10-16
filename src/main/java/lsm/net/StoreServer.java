@@ -129,6 +129,19 @@ public final class StoreServer implements Closeable {
                 continue;
             }
 
+            try {
+                // Nagle's algorithm holds a small write back waiting for more
+                // to send, and a reply is the one thing a request-response
+                // protocol has nothing to follow. Measured at nothing over
+                // loopback, where the acknowledgement comes straight back --
+                // this is for the networks where it does not, and where the
+                // interaction with delayed acknowledgement costs tens of
+                // milliseconds rather than microseconds.
+                client.setTcpNoDelay(true);
+            } catch (IOException e) {
+                // Not fatal: the connection simply pays the delay.
+            }
+
             open.add(client);
             try {
                 connections.execute(() -> serve(client));
