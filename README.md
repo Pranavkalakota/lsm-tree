@@ -452,6 +452,54 @@ through it — so the server is the narrower of the two. Length-prefixed framing
 would fix it and would also mean you could no longer drive the thing from
 `nc`, which did not seem the right trade for the demo.
 
+### What the network costs
+
+Every other figure in this README is an in-process call. Putting a socket, a
+line protocol and a round trip in front of the same engine changes the picture
+completely:
+
+| Request | ops/sec | p50 | p99 |
+| --- | ---: | ---: | ---: |
+| In process, no socket | 2,271,773 | 0.38us | 0.75us |
+| `GET` over TCP | 59,726 | 16.75us | 21.83us |
+| `PUT` over TCP | 47,539 | 20.92us | 26.88us |
+| `GET` pipelined 32 deep | 399,916 | - | - |
+
+**A round trip costs 38x an in-process call**, and that number is the whole
+point of measuring this. The store answers a read in 0.38us; delivering that
+answer over loopback takes 16.75us. Nothing in the engine is the bottleneck
+any more — at this point it is almost entirely the socket, and a faster LSM
+tree would not move the figure.
+
+**Pipelining proves it. Thirty-two requests in flight gives 399,916/sec, 6.7x
+the sequential rate** — the same server, the same engine, the same reads, just
+without waiting for each answer before asking the next question. A client that
+waits is measuring the wire; a client that does not is measuring the store.
+
+Throughput as clients are added, each on its own connection and thread:
+
+| Clients | ops/sec |
+| ---: | ---: |
+| 1 | 59,645 |
+| 2 | 98,320 |
+| 4 | 118,757 |
+| 8 | 127,426 |
+| 16 | 110,984 |
+
+It scales to about eight and then goes backwards. That is roughly the core
+count of the machine, which is what a thread-per-connection server should be
+expected to do: past that point the threads are competing for cores rather
+than adding throughput. Fixing it means not giving each connection a thread,
+which is a different server than this one.
+
+**One thing measured and deliberately not claimed.** The server sets
+`TCP_NODELAY` on accepted connections, and it is worth nothing here: three
+runs each way came out at 56,900/sec with it and 58,000/sec without, ranges
+overlapping. Over loopback the acknowledgement comes straight back, so Nagle's
+algorithm never has anything to delay. It stays on because the networks it
+matters on are the ones this was not measured over, where the interaction with
+delayed acknowledgement is measured in tens of milliseconds.
+
 ## Design Notes
 
 **Versions are global, not per shard.** One counter issues them, so versions
